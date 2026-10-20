@@ -5,6 +5,7 @@
 #include <sys/ioctl.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <climits>
 
 namespace irisva {
 Buffer::~Buffer() {
@@ -371,11 +372,11 @@ API(
                                    VASurfaceAttribMinHeight, VASurfaceAttribMaxWidth,
                                    VASurfaceAttribMaxHeight, VASurfaceAttribMemoryType};
     unsigned values[] = {profile_fourcc(profile), 128, 128, 8192, 8192,
-                         VA_SURFACE_ATTRIB_MEM_TYPE_VA};
+                         VA_SURFACE_ATTRIB_MEM_TYPE_VA | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME |
+                             VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2};
     if (config.entrypoint == VAEntrypointVideoProc) {
         values[1] = 16;
         values[2] = 2;
-        values[5] |= VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
     } if (config.entrypoint == VAEntrypointEncSlice) {
         values[3] = 3840;
         values[4] = 2160;
@@ -398,41 +399,70 @@ API(
         return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
     } std::memcpy(attrs, a, n * sizeof(*a));
     *count = n; return VA_STATUS_SUCCESS;)
+// Normalize the legacy descriptor before applying the shared DMA-BUF checks.
+// PRIME1 has no explicit modifier, so only unflagged linear buffers are accepted.
+static VADRMPRIMESurfaceDescriptor
+prime_descriptor(const VASurfaceAttribExternalBuffers &external) {
+    check(external.num_buffers == 1 && external.buffers && external.buffers[0] <= INT_MAX &&
+              external.num_planes == 2 && !external.flags,
+          "PRIME1 requires one linear DMA-BUF with two planes", VA_STATUS_ERROR_INVALID_PARAMETER);
+    VADRMPRIMESurfaceDescriptor desc{};
+    desc.fourcc = external.pixel_format;
+    desc.width = external.width;
+    desc.height = external.height;
+    desc.num_objects = desc.num_layers = 1;
+    desc.objects[0].fd = static_cast<int>(external.buffers[0]);
+    desc.objects[0].size = external.data_size;
+    desc.objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
+    auto &layer = desc.layers[0];
+    layer.drm_format = external.pixel_format == VA_FOURCC_P010 ? DRM_FORMAT_P010 : DRM_FORMAT_NV12;
+    layer.num_planes = 2;
+    for (unsigned i = 0; i < 2; ++i) {
+        layer.offset[i] = external.offsets[i];
+        layer.pitch[i] = external.pitches[i];
+    }
+    return desc;
+}
 static std::shared_ptr<Memory> import_prime(const VADRMPRIMESurfaceDescriptor &desc, unsigned width,
-                                            unsigned height) {
-    check(desc.fourcc == VA_FOURCC_NV12 && desc.width == width && desc.height == height &&
+                                            unsigned height, unsigned fourcc) {
+    check(desc.fourcc == fourcc && desc.width == width && desc.height == height &&
               desc.num_objects == 1 && desc.objects[0].fd >= 0 &&
               desc.objects[0].drm_format_modifier == DRM_FORMAT_MOD_LINEAR,
-          "import requires single-object linear NV12", VA_STATUS_ERROR_INVALID_PARAMETER);
+          "import requires matching single-object linear NV12/P010",
+          VA_STATUS_ERROR_INVALID_PARAMETER);
+    bool p010 = fourcc == VA_FOURCC_P010;
     unsigned offsets[2]{}, pitches[2]{};
     if (desc.num_layers == 1) {
         const auto &l = desc.layers[0];
-        check(l.drm_format == DRM_FORMAT_NV12 && l.num_planes == 2 && !l.object_index[0] &&
-                  !l.object_index[1],
-              "invalid composed NV12 layer", VA_STATUS_ERROR_INVALID_PARAMETER);
+        check(l.drm_format == (p010 ? DRM_FORMAT_P010 : DRM_FORMAT_NV12) && l.num_planes == 2 &&
+                  !l.object_index[0] && !l.object_index[1],
+              "invalid composed DMA-BUF layer", VA_STATUS_ERROR_INVALID_PARAMETER);
         for (unsigned i = 0; i < 2; ++i) {
             offsets[i] = l.offset[i];
             pitches[i] = l.pitch[i];
         }
     } else {
-        check(desc.num_layers == 2 && desc.layers[0].drm_format == DRM_FORMAT_R8 &&
-                  desc.layers[1].drm_format == DRM_FORMAT_GR88,
-              "invalid separate NV12 layers", VA_STATUS_ERROR_INVALID_PARAMETER);
+        check(desc.num_layers == 2 &&
+                  desc.layers[0].drm_format == (p010 ? DRM_FORMAT_R16 : DRM_FORMAT_R8) &&
+                  desc.layers[1].drm_format == (p010 ? DRM_FORMAT_GR1616 : DRM_FORMAT_GR88),
+              "invalid separate DMA-BUF layers", VA_STATUS_ERROR_INVALID_PARAMETER);
         for (unsigned i = 0; i < 2; ++i) {
             const auto &l = desc.layers[i];
-            check(l.num_planes == 1 && !l.object_index[0], "invalid NV12 plane",
+            check(l.num_planes == 1 && !l.object_index[0], "invalid DMA-BUF plane",
                   VA_STATUS_ERROR_INVALID_PARAMETER);
             offsets[i] = l.offset[0];
             pitches[i] = l.pitch[0];
         }
     }
-    check(pitches[0] >= ((width + 1) & ~1u) && pitches[0] == pitches[1] &&
-              offsets[1] >= offsets[0] && (offsets[1] - offsets[0]) % pitches[0] == 0 &&
+    unsigned sample_bytes = p010 ? 2 : 1;
+    unsigned row_bytes = ((width + 1) & ~1u) * sample_bytes;
+    check(pitches[0] >= row_bytes && pitches[0] == pitches[1] && pitches[0] % sample_bytes == 0 &&
+              offsets[0] % sample_bytes == 0 && offsets[1] >= offsets[0] &&
+              (offsets[1] - offsets[0]) % pitches[0] == 0 &&
               (offsets[1] - offsets[0]) / pitches[0] >= height &&
-              uint64_t(offsets[1]) + uint64_t((height + 1) / 2 - 1) * pitches[1] +
-                      ((width + 1) & ~1u) <=
+              uint64_t(offsets[1]) + uint64_t((height + 1) / 2 - 1) * pitches[1] + row_bytes <=
                   desc.objects[0].size,
-          "unsupported NV12 DMA-BUF plane layout", VA_STATUS_ERROR_INVALID_PARAMETER);
+          "unsupported DMA-BUF plane layout", VA_STATUS_ERROR_INVALID_PARAMETER);
     auto m = std::make_shared<Memory>();
     m->fd = fcntl(desc.objects[0].fd, F_DUPFD_CLOEXEC, 0);
     check(m->fd >= 0, "duplicate imported DMA-BUF");
@@ -442,6 +472,7 @@ static std::shared_ptr<Memory> import_prime(const VADRMPRIMESurfaceDescriptor &d
     check(size >= 0 && uint64_t(size) >= desc.objects[0].size,
           "DMA-BUF allocation smaller than descriptor", VA_STATUS_ERROR_INVALID_PARAMETER);
     m->size = desc.objects[0].size;
+    m->fourcc = fourcc;
     m->width = width;
     m->height = height;
     m->stride = pitches[0];
@@ -459,9 +490,8 @@ API(
     check(w && h && w <= 8192 && h <= 8192 && ids && count <= 256, "invalid surfaces",
           VA_STATUS_ERROR_INVALID_PARAMETER);
     check(!nattrs || attrs, "null surface attributes", VA_STATUS_ERROR_INVALID_PARAMETER);
-    unsigned memory_type = VA_SURFACE_ATTRIB_MEM_TYPE_VA;
-    const VADRMPRIMESurfaceDescriptor *external = nullptr; bool explicit_modifier = false;
-    for (unsigned i = 0; i < nattrs; ++i) {
+    unsigned memory_type = VA_SURFACE_ATTRIB_MEM_TYPE_VA; const void *external = nullptr;
+    bool explicit_modifier = false; for (unsigned i = 0; i < nattrs; ++i) {
         if (!(attrs[i].flags & VA_SURFACE_ATTRIB_SETTABLE))
             continue;
 #if VA_CHECK_VERSION(1, 13, 0)
@@ -482,7 +512,7 @@ API(
         if (attrs[i].type == VASurfaceAttribExternalBufferDescriptor) {
             check(attrs[i].value.type == VAGenericValueTypePointer && attrs[i].value.value.p,
                   "invalid external descriptor", VA_STATUS_ERROR_INVALID_PARAMETER);
-            external = static_cast<const VADRMPRIMESurfaceDescriptor *>(attrs[i].value.value.p);
+            external = attrs[i].value.value.p;
             continue;
         }
         check(attrs[i].value.type == VAGenericValueTypeInteger, "unsupported surface attribute",
@@ -497,14 +527,19 @@ API(
         else if (attrs[i].type != VASurfaceAttribUsageHint)
             throw Error(VA_STATUS_ERROR_ATTR_NOT_SUPPORTED, "unsupported surface attribute");
     } check(memory_type == VA_SURFACE_ATTRIB_MEM_TYPE_VA ||
+                memory_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME ||
                 memory_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
             "unsupported surface memory type", VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
-    std::shared_ptr<Memory> imported; if (memory_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2) {
-        check(external && !explicit_modifier && count == 1 && format == VA_RT_FORMAT_YUV420,
-              "PRIME2 import requires one NV12 descriptor/surface",
-              VA_STATUS_ERROR_INVALID_PARAMETER);
-        imported = import_prime(*external, w, h);
-    } else check(!external, "external descriptor without PRIME2 memory type",
+    std::shared_ptr<Memory> imported; if (memory_type != VA_SURFACE_ATTRIB_MEM_TYPE_VA) {
+        check(external && !explicit_modifier && count == 1,
+              "PRIME import requires one descriptor/surface", VA_STATUS_ERROR_INVALID_PARAMETER);
+        auto desc =
+            memory_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME
+                ? prime_descriptor(*static_cast<const VASurfaceAttribExternalBuffers *>(external))
+                : *static_cast<const VADRMPRIMESurfaceDescriptor *>(external);
+        imported = import_prime(desc, w, h,
+                                format == VA_RT_FORMAT_YUV420_10 ? VA_FOURCC_P010 : VA_FOURCC_NV12);
+    } else check(!external, "external descriptor without PRIME memory type",
                  VA_STATUS_ERROR_INVALID_PARAMETER);
     for (unsigned i = 0; i < count; ++i) {
         auto s = std::make_shared<Surface>();

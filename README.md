@@ -26,6 +26,7 @@ and Sunshine. HEVC encoding is tested with FFmpeg and GStreamer.
   and other VPP filters are unsupported.
 - Compatible DMA-BUF paths avoid raw-frame copies. Applications that cache
   surfaces before decoding use a GPU copy by default.
+- PRIME1/PRIME2 import supports single-buffer linear NV12/P010; export uses PRIME2.
 
 ## Performance
 

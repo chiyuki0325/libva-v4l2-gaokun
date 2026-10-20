@@ -7,6 +7,7 @@ also require `ffprobe` and software H.264/HEVC decoding.
 | Test | Coverage |
 | --- | --- |
 | `decoder/main10.cpp` | Main10 8/10-bit capability probing, config validation, surface enumeration, and context bit-depth selection. |
+| `decoder/prime-import.cpp` | PRIME1/PRIME2 NV12/P010 imports, malformed descriptors, shared storage, and caller FD ownership. |
 | `encoder/ffmpeg-smoke.py` | Profiles, rate control, dimensions, frame counts, keyframes, and decoded quality. |
 | `encoder/api-smoke.cpp` | Uploads, direct/staged input, rejected requests, coded buffers, and resource cleanup. |
 | `encoder/async.cpp` | Queued versus serial output, QP/IDR changes, non-IDR I requests, synchronization, timeouts, and pending resource destruction. |
@@ -17,6 +18,10 @@ To select an uninstalled driver before running a test:
 ```sh
 export LIBVA_DRIVER_NAME=v4l2 LIBVA_DRIVERS_PATH="$PWD/build"
 ```
+
+The PRIME import test requires `/dev/dma_heap/system`. It checks padded layouts
+and nonzero offsets, and verifies that importing and exporting retain the same
+DMA-BUF rather than copying its pixels.
 
 The FFmpeg, async, and writable-export tests accept `--hevc` to exercise HEVC
 Main instead of H.264. The HEVC async test also checks rejected picture types,
