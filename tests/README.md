@@ -6,6 +6,7 @@ also require `ffprobe` and software H.264/HEVC decoding.
 
 | Test | Coverage |
 | --- | --- |
+| `decoder/main10.cpp` | Main10 8/10-bit capability probing, config validation, surface enumeration, and context bit-depth selection. |
 | `encoder/ffmpeg-smoke.py` | Profiles, rate control, dimensions, frame counts, keyframes, and decoded quality. |
 | `encoder/api-smoke.cpp` | Uploads, direct/staged input, rejected requests, coded buffers, and resource cleanup. |
 | `encoder/async.cpp` | Queued versus serial output, QP/IDR changes, non-IDR I requests, synchronization, timeouts, and pending resource destruction. |

@@ -146,6 +146,10 @@ static unsigned encode_attribute(VAConfigAttribType type, VAProfile profile) {
     }
 }
 static unsigned profile_format(VAProfile p) {
+    // Main10 also decodes 8-bit HEVC. Chromium requires YUV420 when
+    // probing this profile (unlike VP9 profile 2).
+    if (p == VAProfileHEVCMain10)
+        return VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10;
     return is_10bit(p) ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420;
 }
 static unsigned profile_fourcc(VAProfile p) {
@@ -338,8 +342,8 @@ API(
                 config.rate_control = attrs[i].value;
             }
         } else if (attrs[i].type == VAConfigAttribRTFormat)
-            check(attrs[i].value == profile_format(p), "unsupported render format",
-                  VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+            check(attrs[i].value && !(attrs[i].value & ~profile_format(p)),
+                  "unsupported render format", VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
         else if (e == VAEntrypointVLD && attrs[i].type == VAConfigAttribDecSliceMode)
             check(attrs[i].value == VA_DEC_SLICE_MODE_NORMAL, "unsupported slice mode",
                   VA_STATUS_ERROR_ATTR_NOT_SUPPORTED);
@@ -362,7 +366,7 @@ API(
     auto config = lookup(d.configs, id, VA_STATUS_ERROR_INVALID_CONFIG);
     auto profile = config.profile;
     check(count, "null surface attribute count", VA_STATUS_ERROR_INVALID_PARAMETER);
-    VASurfaceAttrib a[6]{};
+    VASurfaceAttrib a[7]{};
     VASurfaceAttribType types[] = {VASurfaceAttribPixelFormat, VASurfaceAttribMinWidth,
                                    VASurfaceAttribMinHeight, VASurfaceAttribMaxWidth,
                                    VASurfaceAttribMaxHeight, VASurfaceAttribMemoryType};
@@ -382,14 +386,18 @@ API(
             a[i].flags |= VA_SURFACE_ATTRIB_SETTABLE;
         a[i].value.type = VAGenericValueTypeInteger;
         a[i].value.value.i = values[i];
+    } unsigned n = 6;
+    if (profile == VAProfileHEVCMain10) {
+        a[n] = a[0];
+        a[n++].value.value.i = VA_FOURCC_NV12;
     } if (!attrs) {
-        *count = 6;
+        *count = n;
         return VA_STATUS_SUCCESS;
-    } if (*count < 6) {
-        *count = 6;
+    } if (*count < n) {
+        *count = n;
         return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
-    } std::memcpy(attrs, a, sizeof(a));
-    *count = 6; return VA_STATUS_SUCCESS;)
+    } std::memcpy(attrs, a, n * sizeof(*a));
+    *count = n; return VA_STATUS_SUCCESS;)
 static std::shared_ptr<Memory> import_prime(const VADRMPRIMESurfaceDescriptor &desc, unsigned width,
                                             unsigned height) {
     check(desc.fourcc == VA_FOURCC_NV12 && desc.width == width && desc.height == height &&
@@ -531,8 +539,9 @@ API(create_context,
         check(w <= 3840 && h <= 2160 && !(w & 1) && !(h & 1), "unsupported encoder dimensions",
               VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
     for (int i = 0; i < count; ++i) surface(d, targets[i]); c->width = w; c->height = h;
+    c->decode_profile = c->profile; c->decode_surfaces = std::max(0, count);
     int render_fd = ctx->drm_state ? static_cast<drm_state *>(ctx->drm_state)->fd : -1;
-    if (c->entrypoint == VAEntrypointVLD)
+    if (c->entrypoint == VAEntrypointVLD && c->profile != VAProfileHEVCMain10)
         c->decoder = std::make_shared<Decoder>(d.device, w, h, std::max(0, count), c->profile,
                                                render_fd);
     if (processing) c->vpp = std::make_unique<Vpp>(); *result = d.next_id++;
@@ -601,8 +610,19 @@ API(
     auto c = context(d, id);
     check(!c->target, "picture already open", VA_STATUS_ERROR_OPERATION_FAILED);
     auto s = surface(d, target);
-    check(s->fourcc == profile_fourcc(c->profile), "surface format does not match context",
-          VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+    // Main10 permits NV12 and P010. Select the stateful decoder's bit depth
+    // from the first target, including clients that create a context without
+    // render targets. Keep it fixed for the lifetime of the decoder.
+    if (c->profile == VAProfileHEVCMain10 && !c->decoder) {
+        auto profile = s->fourcc == VA_FOURCC_NV12 ? VAProfileHEVCMain : VAProfileHEVCMain10;
+        check(s->fourcc == profile_fourcc(profile), "unsupported HEVC surface format",
+              VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+        int render_fd = ctx->drm_state ? static_cast<drm_state *>(ctx->drm_state)->fd : -1;
+        c->decoder = std::make_shared<Decoder>(d.device, c->width, c->height, c->decode_surfaces,
+                                               profile, render_fd);
+        c->decode_profile = profile;
+    } check(s->fourcc == profile_fourcc(c->decode_profile), "surface format does not match context",
+            VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
     if (s->pending || (s->encode_task && s->encode_task->pending)) synchronize(d, s);
     check(!s->derived_images, "surface has derived images", VA_STATUS_ERROR_SURFACE_BUSY);
     if (c->entrypoint == VAEntrypointEncSlice) {
@@ -746,7 +766,7 @@ API(
             c->decoder->submit(bytes, target);
         } else if (is_hevc(c->profile)) {
             auto next_state = c->hevc;
-            auto bytes = hevc_bitstream(c->profile, c->hevc_picture, next_state);
+            auto bytes = hevc_bitstream(c->decode_profile, c->hevc_picture, next_state);
             c->decoder->submit(bytes, target);
             c->hevc = std::move(next_state);
         } else {
