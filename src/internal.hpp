@@ -164,6 +164,7 @@ std::vector<uint8_t> hevc_bitstream(VAProfile profile, const HevcPicture &pictur
 
 class Decoder {
     int fd_ = -1;
+    int render_fd_; // Borrowed from the VA display, which outlives the decoder.
     FILE *dump_ = nullptr;
     std::mutex mutex_;
     bool output_on_ = false, capture_on_ = false;
@@ -177,7 +178,7 @@ class Decoder {
     void configure_capture();
     void pump(int timeout_ms);
     void requeue();
-    void fail_picture(uint64_t token);
+    void recover_picture(uint64_t token);
 
   public:
     Decoder(const std::string &device, unsigned width, unsigned height, unsigned surfaces,
@@ -229,6 +230,9 @@ class Encoder {
     void finish();
 };
 void copy_surface(Memory &destination, Memory &source, unsigned width, unsigned height);
+std::shared_ptr<Memory> allocate_surface(int render_fd, unsigned width, unsigned height,
+                                         unsigned fourcc);
+void fill_neutral_surface(Memory &memory, unsigned width, unsigned height);
 void wait_surface_access(const Memory &memory, short events);
 bool vpp_supported(VAProfile profile, VAEntrypoint entrypoint);
 void vpp_caps(VAProcPipelineCaps &caps);

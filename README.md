@@ -27,6 +27,8 @@ and Sunshine. HEVC encoding is tested with FFmpeg and GStreamer.
 - Compatible DMA-BUF paths avoid raw-frame copies. Applications that cache
   surfaces before decoding use a GPU copy by default.
 - PRIME1/PRIME2 import supports single-buffer linear NV12/P010; export uses PRIME2.
+- Identified decode errors produce a neutral gray frame so playback can continue.
+  Recovery requires the Iris error-timestamp patch below; stalls remain errors.
 
 ## Performance
 
@@ -53,8 +55,8 @@ and pipeline configuration.
 
 - Linux with the Qualcomm Iris stateful driver and MSM DRM support.
 - The changes supplied in [patches/](patches/), unless already present in your
-  kernel: decode-order output, larger CAPTURE pools, and encoder deblocking
-  controls. The patches are references to integrate into your kernel.
+  kernel: decode-order output, larger CAPTURE pools, encoder deblocking
+  controls, and preserved error timestamps.
 - Access to the Iris video devices and DRM render node.
 - A C++17 compiler, Meson ≥ 0.61, Ninja, pkg-config, and development libraries
   for libva, libdrm, EGL, GLES 3.2, and GBM.

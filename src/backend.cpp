@@ -244,24 +244,7 @@ static std::shared_ptr<Memory> allocate_undecoded_surface(VADriverContextP ctx, 
     // lifetime. A consumer may keep its fd without calling export again.
     check(ctx->drm_state, "surface allocation requires a DRM display");
     int fd = static_cast<drm_state *>(ctx->drm_state)->fd;
-    auto m = std::make_shared<Memory>();
-    m->width = s.width;
-    m->height = s.height;
-    m->fourcc = s.fourcc;
-    unsigned bytes_per_sample = s.fourcc == VA_FOURCC_P010 ? 2 : 1;
-    m->stride = (s.width * bytes_per_sample + 127) & ~127u;
-    m->storage_height = (s.height + 31) & ~31u;
-    long page_size = sysconf(_SC_PAGESIZE);
-    check(page_size > 0, "cannot determine page size");
-    size_t size = size_t(m->stride) * m->storage_height * 3 / 2;
-    m->size = (size + size_t(page_size) - 1) / size_t(page_size) * size_t(page_size);
-    int coherent = 0;
-    m->fd = irisva_msm_allocate(fd, m->size, &coherent);
-    m->origin = coherent ? MemoryOrigin::MsmCoherent : MemoryOrigin::MsmWriteCombined;
-    check(m->fd >= 0, "allocate/export undecoded MSM surface", VA_STATUS_ERROR_ALLOCATION_FAILED);
-    trace("allocated undecoded surface %ux%u fourcc=%#x pitch=%u size=%zu coherent=%d", s.width,
-          s.height, s.fourcc, m->stride, m->size, coherent);
-    return m;
+    return allocate_surface(fd, s.width, s.height, s.fourcc);
 }
 
 API(query_profiles, (VADriverContextP ctx, VAProfile *out, int *count), (void)d;

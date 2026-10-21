@@ -93,7 +93,8 @@ std::string find_device() {
 }
 Decoder::Decoder(const std::string &device, unsigned width, unsigned height, unsigned surfaces,
                  VAProfile profile, int render_fd)
-    : width_(width), height_(height), pool_size_(std::min(64u, std::max(32u, surfaces + 4))),
+    : render_fd_(render_fd), width_(width), height_(height),
+      pool_size_(std::min(64u, std::max(32u, surfaces + 4))),
       fourcc_(is_10bit(profile) ? VA_FOURCC_P010 : VA_FOURCC_NV12), copier_(render_fd) {
     fd_ = open(device.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
     check(fd_ >= 0, "open Iris decoder");
@@ -231,15 +232,33 @@ void Decoder::requeue() {
         }
     }
 }
-void Decoder::fail_picture(uint64_t token) {
+void Decoder::recover_picture(uint64_t token) {
     auto it = pending_.find(token);
     if (it == pending_.end())
         return; // The other queue may already have completed this picture.
     auto surface = it->second;
     surface->status = VA_STATUS_ERROR_DECODING_ERROR;
+    try {
+        // CAPTURE storage can still be a firmware reference. Replace only the
+        // client-visible image, keeping previously exported/imported storage.
+        auto memory = surface->persistent_export
+                          ? surface->memory
+                          : allocate_surface(render_fd_, surface->width, surface->height, fourcc_);
+        check(bool(memory), "persistent surface lost its storage");
+        fill_neutral_surface(*memory, surface->width, surface->height);
+        surface->memory = memory;
+        surface->status = VA_STATUS_SUCCESS;
+        std::fprintf(stderr, "iris-vaapi: replaced damaged picture token=%llu with neutral gray\n",
+                     (unsigned long long)token);
+    } catch (const Error &e) {
+        surface->status = e.status;
+    } catch (const std::bad_alloc &) {
+        surface->status = VA_STATUS_ERROR_ALLOCATION_FAILED;
+    }
     surface->pending = false;
     pending_.erase(it);
-    trace("failed token=%llu", (unsigned long long)token);
+    trace("completed damaged token=%llu status=%#x", (unsigned long long)token,
+          unsigned(surface->status));
 }
 void Decoder::pump(int timeout_ms) {
     requeue();
@@ -273,7 +292,7 @@ void Decoder::pump(int timeout_ms) {
         if (q.buffer.flags & V4L2_BUF_FLAG_ERROR) {
             uint64_t token =
                 uint64_t(q.buffer.timestamp.tv_sec) * 1000000 + q.buffer.timestamp.tv_usec;
-            fail_picture(token);
+            recover_picture(token);
         }
     }
     if (!capture_on_ || last_)
@@ -294,7 +313,7 @@ void Decoder::pump(int timeout_ms) {
         if (q.buffer.flags & V4L2_BUF_FLAG_ERROR) {
             // An empty error buffer still completes the picture identified by
             // its timestamp. Older kernels clear it; do not guess that frame.
-            fail_picture(token);
+            recover_picture(token);
         } else if (q.plane.bytesused > q.plane.data_offset) {
             auto it = pending_.find(token);
             check(token && token < next_token_, "unmatched CAPTURE timestamp",

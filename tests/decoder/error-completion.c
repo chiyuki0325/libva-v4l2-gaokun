@@ -5,7 +5,10 @@
 // IRIS_TEST_ERROR_COUNT=1. Set IRIS_TEST_ERROR_PAYLOAD=keep for nonempty errors.
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
+#include <linux/dma-buf.h>
 #include <linux/videodev2.h>
+#include <stdatomic.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -13,11 +16,19 @@
 #include <string.h>
 #include <sys/ioctl.h>
 
+static atomic_int fail_write;
+
 int ioctl(int fd, unsigned long request, ...) {
     va_list args;
     va_start(args, request);
     void *arg = va_arg(args, void *);
     va_end(args);
+    if (request == DMA_BUF_IOCTL_SYNC &&
+        (((struct dma_buf_sync *)arg)->flags & DMA_BUF_SYNC_WRITE) &&
+        atomic_exchange(&fail_write, 0)) {
+        errno = EIO;
+        return -1;
+    }
     int (*real_ioctl)(int, unsigned long, ...) = dlsym(RTLD_NEXT, "ioctl");
     int result = real_ioctl(fd, request, arg);
     const char *queue = getenv("IRIS_TEST_ERROR_QUEUE");
@@ -39,6 +50,8 @@ int ioctl(int fd, unsigned long request, ...) {
         return result;
 
     buffer->flags |= V4L2_BUF_FLAG_ERROR;
+    if (getenv("IRIS_TEST_FAIL_RECOVERY"))
+        atomic_store(&fail_write, 1);
     const char *payload = getenv("IRIS_TEST_ERROR_PAYLOAD");
     if (capture && (!payload || strcmp(payload, "keep"))) {
         buffer->m.planes[0].bytesused = 0;
@@ -46,5 +59,7 @@ int ioctl(int fd, unsigned long request, ...) {
     }
     fprintf(stderr, "injected %s error token=%llu\n", capture ? "CAPTURE" : "OUTPUT",
             (unsigned long long)token);
+    if (getenv("IRIS_TEST_ZERO_TIMESTAMP"))
+        buffer->timestamp = (struct timeval){0};
     return result;
 }

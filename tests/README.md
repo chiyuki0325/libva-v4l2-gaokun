@@ -8,6 +8,7 @@ also require `ffprobe` and software H.264/HEVC decoding.
 | --- | --- |
 | `decoder/main10.cpp` | Main10 8/10-bit capability probing, config validation, surface enumeration, and context bit-depth selection. |
 | `decoder/prime-import.cpp` | PRIME1/PRIME2 NV12/P010 imports, malformed descriptors, shared storage, and caller FD ownership. |
+| `decoder/error-recovery.py` | Corrupt HEVC, queue errors, neutral NV12/P010 pixels, B frames, consecutive errors, DRM mapping, and persistent/imported storage. |
 | `encoder/ffmpeg-smoke.py` | Profiles, rate control, dimensions, frame counts, keyframes, and decoded quality. |
 | `encoder/api-smoke.cpp` | Uploads, direct/staged input, rejected requests, coded buffers, and resource cleanup. |
 | `encoder/async.cpp` | Queued versus serial output, QP/IDR changes, non-IDR I requests, synchronization, timeouts, and pending resource destruction. |
@@ -22,6 +23,13 @@ export LIBVA_DRIVER_NAME=v4l2 LIBVA_DRIVERS_PATH="$PWD/build"
 The PRIME import test requires `/dev/dma_heap/system`. It checks padded layouts
 and nonzero offsets, and verifies that importing and exporting retain the same
 DMA-BUF rather than copying its pixels.
+
+Run error recovery with `python3 tests/decoder/error-recovery.py tmp/recovery
+--driver-dir build` on a kernel with the error-timestamp patch. It generates
+HEVC samples with libx265 and builds the adjacent preload shims. Besides real
+corruption, it checks that injected errors replace only the affected frames,
+exports retain their DMA-BUF, and failed fills or missing timestamps do not
+report successful recovery.
 
 The FFmpeg, async, and writable-export tests accept `--hevc` to exercise HEVC
 Main instead of H.264. The HEVC async test also checks rejected picture types,
