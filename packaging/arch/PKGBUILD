@@ -11,7 +11,8 @@ makedepends=('meson' 'ninja')
 optdepends=('qcom-fastcv-binaries: CDSP video scaling'
             'qcom-fastrpc: CDSP video scaling')
 source=("$pkgname-$pkgver.tar.gz")
-sha256sums=('0aabfba1fbdb8515d7e64597ba4e6b2aee1d04caf30f992b1dabe460289adc94')
+# The archive is generated locally from the current working tree.
+sha256sums=('SKIP')
 
 build() {
   # make-dist.py fixes source mtimes to zero. Reusing Ninja objects from an

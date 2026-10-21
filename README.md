@@ -79,8 +79,9 @@ makepkg -si
 ```
 
 The [PKGBUILD](packaging/arch/PKGBUILD) packages the userspace driver. After
-editing packaged sources, regenerate the archive, update `sha256sums` using
-`makepkg -g`, and refresh `.SRCINFO` with `makepkg --printsrcinfo > .SRCINFO`.
+editing packaged sources, regenerate the archive; local snapshots skip checksum
+verification. Refresh `.SRCINFO` with `makepkg --printsrcinfo > .SRCINFO` when
+package metadata changes.
 
 Alternatively, build and install with Meson:
 

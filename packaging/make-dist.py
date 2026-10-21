@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Create a local userspace makepkg source archive and print its SHA256 checksum.
-
-After changing sources, refresh PKGBUILD checksums with `makepkg -g`.
-"""
+"""Create a local userspace makepkg source archive from the current working tree."""
 import argparse
 import gzip
-import hashlib
 import io
 from pathlib import Path
 import re
@@ -14,7 +10,7 @@ import tarfile
 
 
 def archive(destination, entries):
-    # Fixed metadata makes checksums independent of checkout timestamps/owners.
+    # Fixed metadata makes archives independent of checkout timestamps/owners.
     with destination.open('wb') as raw, gzip.GzipFile(filename='', mode='wb', fileobj=raw, mtime=0) as gz:
         with tarfile.open(fileobj=gz, mode='w') as tar:
             for name, path in sorted(entries):
@@ -23,7 +19,7 @@ def archive(destination, entries):
                 info.size = len(data)
                 info.mode = 0o644
                 tar.addfile(info, io.BytesIO(data))
-    print(hashlib.sha256(destination.read_bytes()).hexdigest(), destination)
+    print(destination)
 
 
 def main():

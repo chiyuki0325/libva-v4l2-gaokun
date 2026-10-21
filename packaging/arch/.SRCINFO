@@ -16,6 +16,6 @@ pkgbase = libva-v4l2
 	optdepends = qcom-fastcv-binaries: CDSP video scaling
 	optdepends = qcom-fastrpc: CDSP video scaling
 	source = libva-v4l2-1.0.0.tar.gz
-	sha256sums = 0aabfba1fbdb8515d7e64597ba4e6b2aee1d04caf30f992b1dabe460289adc94
+	sha256sums = SKIP
 
 pkgname = libva-v4l2
