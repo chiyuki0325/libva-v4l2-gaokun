@@ -9,9 +9,18 @@ project(
 va = dependency('libva', version: '>=1.10')
 drm = dependency('libdrm')
 threads = dependency('threads')
-egl = dependency('egl')
-gles = dependency('glesv2', version: '>=3.2')
-gbm = dependency('gbm')
+gpu_copy_option = get_option('gpu_copy')
+egl = dependency('egl', required: gpu_copy_option)
+gles = dependency('glesv2', version: '>=3.2', required: gpu_copy_option)
+gbm = dependency('gbm', required: gpu_copy_option)
+have_gpu_copy = egl.found() and gles.found() and gbm.found()
+copy_dependencies = []
+copy_source = files('src/cpu-copy.cpp')
+if have_gpu_copy
+  copy_dependencies = [egl, gles, gbm]
+  copy_source = files('src/gpu-copy.cpp')
+endif
+summary('GPU surface copy', have_gpu_copy)
 
 cpp = meson.get_compiler('cpp')
 fastcv_option = get_option('fastcv')
@@ -51,7 +60,6 @@ sources = files(
   'src/backend.cpp',
   'src/decoder.cpp',
   'src/encoder.cpp',
-  'src/gpu-copy.cpp',
   'src/h264.cpp',
   'src/hevc.cpp',
   'src/msm.c',
@@ -64,8 +72,8 @@ driver_install_dir = get_option('libdir') / 'dri'
 
 shared_library(
   'v4l2_drv_video',
-  sources,
-  dependencies: [va, drm, threads, egl, gles, gbm] + vpp_dependencies,
+  sources + copy_source,
+  dependencies: [va, drm, threads] + copy_dependencies + vpp_dependencies,
   name_prefix: '',
   install: true,
   install_dir: driver_install_dir,
@@ -84,6 +92,7 @@ install_data('LICENSE', install_dir: get_option('datadir') / 'licenses' / meson.
 
 formatter = find_program('clang-format', required: false)
 if formatter.found()
+  sources += files('src/cpu-copy.cpp', 'src/gpu-copy.cpp')
   run_target('format', command: [formatter, '-i', '--style=file', sources, headers])
   run_target('format-check', command: [formatter, '--dry-run', '--Werror', '--style=file', sources, headers])
 endif

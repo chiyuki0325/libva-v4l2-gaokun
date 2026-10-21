@@ -61,7 +61,8 @@ class Decoder;
 class SurfaceCopier {
     // Calls are serialized by the owning decoder or encoder, including lazy setup.
     struct Impl;
-    int render_fd_; // Borrowed VA display fd; duplicated when GPU copying is first used.
+    // Borrowed VA display fd; duplicated when GPU copying is first used.
+    [[maybe_unused]] int render_fd_;
     std::unique_ptr<Impl> impl_;
 
   public:

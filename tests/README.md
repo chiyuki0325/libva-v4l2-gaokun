@@ -52,4 +52,17 @@ Optional failure injection helpers (build commands are in their headers):
   or context destruction timeout, including late CAPTURE after OUTPUT errors.
 
 For staged async input, set `IRIS_TEST_STAGING=1`; add `IRIS_VAAPI_COPY=cpu` to
-exercise CPU staging. Without that override, staging uses the GPU.
+exercise CPU staging. Without that override, staging uses the build's default
+copy path.
+
+## Build options
+
+`python3 tests/build/gpu-copy.py tmp/build-options` runs without Iris hardware.
+Install all GPU-copy development dependencies first. It masks each dependency
+in turn and checks `auto`, `enabled`, and `disabled`, source selection, linked
+libraries, and driver loading. Logs and builds remain in the output directory.
+
+On the board, also run the decoder recovery and encoder staging tests against
+`-Dgpu_copy=disabled` without setting `IRIS_VAAPI_COPY`, to exercise the default
+CPU path. Explicit `IRIS_VAAPI_COPY=gpu` must fail only when a copy is needed;
+DMA-BUF zero-copy remains usable.

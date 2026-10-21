@@ -25,7 +25,8 @@ and Sunshine. HEVC encoding is tested with FFmpeg and GStreamer.
   Widths must be multiples of 16 and heights even. Color/bit-depth conversion
   and other VPP filters are unsupported.
 - Compatible DMA-BUF paths avoid raw-frame copies. Applications that cache
-  surfaces before decoding use a GPU copy by default.
+  surfaces before decoding use a GPU copy when built with GPU-copy support,
+  otherwise a CPU copy.
 - PRIME1/PRIME2 import supports single-buffer linear NV12/P010; export uses PRIME2.
 - Identified decode errors produce a neutral gray frame so playback can continue.
   Recovery requires the Iris error-timestamp patch below; stalls remain errors.
@@ -59,7 +60,7 @@ and pipeline configuration.
   controls, and preserved error timestamps.
 - Access to the Iris video devices and DRM render node.
 - A C++17 compiler, Meson ≥ 0.61, Ninja, pkg-config, and development libraries
-  for libva, libdrm, EGL, GLES 3.2, and GBM.
+  for libva and libdrm. GPU-copy additionally requires EGL, GLES 3.2, and GBM.
 - For VPP: system FastCV and FastRPC libraries with a working CDSP runtime.
 
 ## Build and install
@@ -90,6 +91,11 @@ meson setup build --buildtype=release --prefix=/usr -Dlibdir=lib
 meson compile -C build
 sudo meson install -C build
 ```
+
+GPU-copy defaults to `-Dgpu_copy=auto`: enabled when all three dependencies are
+available. Use `-Dgpu_copy=disabled` to omit them and use CPU copying when needed,
+or `-Dgpu_copy=enabled` to require them. DMA-BUF zero-copy paths are unaffected.
+Distribution packages explicitly enable GPU-copy.
 
 FastCV VPP defaults to `-Dfastcv=disabled`. Use `-Dfastcv=auto` to enable it
 when dependencies are available or `-Dfastcv=enabled` to require build dependencies.
@@ -166,7 +172,7 @@ while H.264 remains available.
 | `LIBVA_DRIVER_NAME=v4l2` | Explicitly select this backend. |
 | `LIBVA_DRIVERS_PATH=/path/to/build` | Load an uninstalled build. |
 | `IRIS_VAAPI_DEVICE` / `IRIS_VAAPI_ENCODER_DEVICE` | Override automatic video-device discovery. |
-| `IRIS_VAAPI_COPY=gpu` or `cpu` | Select the copy path; default is `gpu`. |
+| `IRIS_VAAPI_COPY=gpu` or `cpu` | Select the copy path; default is `gpu` when built in, otherwise `cpu`. Explicit `gpu` requires GPU-copy support. |
 | `IRIS_VAAPI_DEBUG=1` | Enable diagnostics. |
 
 Use clang-format 22 and the checked-in `.clang-format`. Meson provides `format`

@@ -18,7 +18,7 @@ build() {
   # make-dist.py fixes source mtimes to zero. Reusing Ninja objects from an
   # earlier snapshot can silently package the old driver despite new sources.
   rm -rf "$srcdir/build"
-  arch-meson "$srcdir/$pkgname-$pkgver" "$srcdir/build"
+  arch-meson "$srcdir/$pkgname-$pkgver" "$srcdir/build" -Dgpu_copy=enabled
   meson compile -C "$srcdir/build"
 }
 
