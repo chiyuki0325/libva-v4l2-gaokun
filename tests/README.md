@@ -37,6 +37,11 @@ Optional failure injection helpers (build commands are in their headers):
 - `delay-completion.c`: load with `LD_PRELOAD` and set
   `IRIS_TEST_DELAY_COMPLETION=1` when running `async` to test caller timeouts and
   the hardware wait watchdog.
+- `decoder/error-completion.c`: load with `LD_PRELOAD` and set
+  `IRIS_TEST_ERROR_QUEUE=capture`, `output`, or `both` to inject errors at
+  decode token 46. `IRIS_TEST_ERROR_FIRST` and `IRIS_TEST_ERROR_COUNT` select
+  another frame or consecutive errors. Errors must complete without a sync
+  or context destruction timeout, including late CAPTURE after OUTPUT errors.
 
 For staged async input, set `IRIS_TEST_STAGING=1`; add `IRIS_VAAPI_COPY=cpu` to
 exercise CPU staging. Without that override, staging uses the GPU.

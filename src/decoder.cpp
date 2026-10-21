@@ -231,6 +231,16 @@ void Decoder::requeue() {
         }
     }
 }
+void Decoder::fail_picture(uint64_t token) {
+    auto it = pending_.find(token);
+    if (it == pending_.end())
+        return; // The other queue may already have completed this picture.
+    auto surface = it->second;
+    surface->status = VA_STATUS_ERROR_DECODING_ERROR;
+    surface->pending = false;
+    pending_.erase(it);
+    trace("failed token=%llu", (unsigned long long)token);
+}
 void Decoder::pump(int timeout_ms) {
     requeue();
     if (timeout_ms) {
@@ -260,8 +270,11 @@ void Decoder::pump(int timeout_ms) {
         }
         check(q.buffer.index < output_.size(), "invalid OUTPUT index");
         output_[q.buffer.index]->queued = false;
-        check(!(q.buffer.flags & V4L2_BUF_FLAG_ERROR), "Iris bitstream error",
-              VA_STATUS_ERROR_DECODING_ERROR);
+        if (q.buffer.flags & V4L2_BUF_FLAG_ERROR) {
+            uint64_t token =
+                uint64_t(q.buffer.timestamp.tv_sec) * 1000000 + q.buffer.timestamp.tv_usec;
+            fail_picture(token);
+        }
     }
     if (!capture_on_ || last_)
         return;
@@ -277,35 +290,42 @@ void Decoder::pump(int timeout_ms) {
         trace("CAPTURE index=%u used=%u offset=%u ts=%lld:%lld flags=%x", q.buffer.index,
               q.plane.bytesused, q.plane.data_offset, (long long)q.buffer.timestamp.tv_sec,
               (long long)q.buffer.timestamp.tv_usec, q.buffer.flags);
-        if (q.plane.bytesused > q.plane.data_offset) {
-            uint64_t token =
-                uint64_t(q.buffer.timestamp.tv_sec) * 1000000 + q.buffer.timestamp.tv_usec;
+        uint64_t token = uint64_t(q.buffer.timestamp.tv_sec) * 1000000 + q.buffer.timestamp.tv_usec;
+        if (q.buffer.flags & V4L2_BUF_FLAG_ERROR) {
+            // An empty error buffer still completes the picture identified by
+            // its timestamp. Older kernels clear it; do not guess that frame.
+            fail_picture(token);
+        } else if (q.plane.bytesused > q.plane.data_offset) {
             auto it = pending_.find(token);
-            check(it != pending_.end(), "unmatched CAPTURE timestamp",
+            check(token && token < next_token_, "unmatched CAPTURE timestamp",
                   VA_STATUS_ERROR_DECODING_ERROR);
-            auto surface = it->second;
-            m->data_offset = q.plane.data_offset;
-            surface->status = q.buffer.flags & V4L2_BUF_FLAG_ERROR ? VA_STATUS_ERROR_DECODING_ERROR
-                                                                   : VA_STATUS_SUCCESS;
-            if (surface->status == VA_STATUS_SUCCESS && surface->persistent_export) {
-                // Keep the fd/offset/pitch which the client already imported.
-                // CAPTURE selection is owned by the stateful decoder, not VA.
-                try {
-                    check(bool(surface->memory), "persistent export lost its storage");
-                    copier_.copy(surface->memory, m, surface->width, surface->height);
-                } catch (const Error &e) {
-                    surface->status = e.status;
-                    surface->pending = false;
-                    pending_.erase(it);
-                    throw;
+            if (it == pending_.end()) {
+                // OUTPUT may have reported an error before CAPTURE returned.
+                trace("discarding completed token=%llu", (unsigned long long)token);
+            } else {
+                auto surface = it->second;
+                m->data_offset = q.plane.data_offset;
+                surface->status = VA_STATUS_SUCCESS;
+                if (surface->persistent_export) {
+                    // Keep the fd/offset/pitch which the client already imported.
+                    // CAPTURE selection is owned by the stateful decoder, not VA.
+                    try {
+                        check(bool(surface->memory), "persistent export lost its storage");
+                        copier_.copy(surface->memory, m, surface->width, surface->height);
+                    } catch (const Error &e) {
+                        surface->status = e.status;
+                        surface->pending = false;
+                        pending_.erase(it);
+                        throw;
+                    }
+                } else {
+                    surface->memory = m;
                 }
-            } else if (!surface->persistent_export) {
-                surface->memory = m;
+                surface->pending = false;
+                trace("decoded token=%llu capture=%u flags=%x", (unsigned long long)token,
+                      q.buffer.index, q.buffer.flags);
+                pending_.erase(it);
             }
-            surface->pending = false;
-            trace("decoded token=%llu capture=%u flags=%x", (unsigned long long)token,
-                  q.buffer.index, q.buffer.flags);
-            pending_.erase(it);
         }
         if (q.buffer.flags & V4L2_BUF_FLAG_LAST) {
             last_ = true;
@@ -343,13 +363,14 @@ void Decoder::submit(const std::vector<uint8_t> &bytes, const std::shared_ptr<Su
         fwrite(bytes.data(), 1, bytes.size(), dump_);
         fflush(dump_);
     }
-    uint64_t token = next_token_++;
+    uint64_t token = next_token_;
     QueueBuffer q(OUTPUT, slot->index);
     q.plane.bytesused = bytes.size();
     q.plane.length = slot->size;
     q.buffer.timestamp.tv_sec = token / 1000000;
     q.buffer.timestamp.tv_usec = token % 1000000;
     checked(fd_, VIDIOC_QBUF, &q.buffer, "QBUF OUTPUT");
+    ++next_token_;
     slot->queued = true;
     surface->pending = true;
     surface->token = token;

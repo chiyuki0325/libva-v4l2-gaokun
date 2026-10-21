@@ -177,6 +177,7 @@ class Decoder {
     void configure_capture();
     void pump(int timeout_ms);
     void requeue();
+    void fail_picture(uint64_t token);
 
   public:
     Decoder(const std::string &device, unsigned width, unsigned height, unsigned surfaces,
