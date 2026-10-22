@@ -66,3 +66,28 @@ On the board, also run the decoder recovery and encoder staging tests against
 `-Dgpu_copy=disabled` without setting `IRIS_VAAPI_COPY`, to exercise the default
 CPU path. Explicit `IRIS_VAAPI_COPY=gpu` must fail only when a copy is needed;
 DMA-BUF zero-copy remains usable.
+
+## CDSP VPP
+
+`meson test -C build --print-errorlogs` checks skeleton selection and HVX
+worker limits without DSP hardware. Build with CDSP enabled, then run on the
+target (upstream FastRPC kernel ABI):
+
+```sh
+c++ -O2 -std=c++17 tests/vpp/scaling.cpp -o build/vpp-scaling \
+  $(pkg-config --cflags --libs libva libva-drm libdrm) -ldl \
+  -Lbuild/src/cdsp -liris_vpp
+export LIBVA_DRIVER_NAME=v4l2 LIBVA_DRIVERS_PATH="$PWD/build"
+export LD_LIBRARY_PATH="$PWD/build/src/cdsp${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export ADSP_LIBRARY_PATH="$PWD/build/src/cdsp${ADSP_LIBRARY_PATH:+;$ADSP_LIBRARY_PATH}"
+./build/vpp-scaling
+```
+
+Checks scalar/HVX agreement, crop/output layouts, DMA-BUF identity, persistent
+mapping and context/buffer lifetime. Also run against a `-Dfastrpc=bundled` build.
+
+Optional ABI audit against SDK 6.7 (all six architectures):
+
+```sh
+python3 tests/vpp/check-abi.py /path/to/19.0.02/Tools /path/to/HexagonSDK6.7
+```
