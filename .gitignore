@@ -31,3 +31,9 @@ __pycache__/
 /debian/files
 /artifacts/
 /*-build-deps_*.deb
+
+# Extracted Meson dependencies.
+/subprojects/QAIC-*/
+/subprojects/fastrpc-*/
+/subprojects/hexagon-open-access-*/
+/subprojects/.wraplock

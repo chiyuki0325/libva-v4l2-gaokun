@@ -1,0 +1,6 @@
+[wrap-file]
+directory = QAIC-a66a0019fb488abae955bbc9b3a9de3dc15962d0
+source_url = https://codeload.github.com/qualcomm/QAIC/tar.gz/a66a0019fb488abae955bbc9b3a9de3dc15962d0
+source_filename = qaic-a66a0019.tar.gz
+source_hash = 7f033a57adee248962a4317b8b4367060bdef1e7fb50fac403e7e21e2552f5af
+patch_directory = qaic
