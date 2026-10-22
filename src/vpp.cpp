@@ -20,7 +20,7 @@ struct CdspApi {
     decltype(&cdsp_vpp_destroy) destroy = nullptr;
     decltype(&cdsp_vpp_import) import = nullptr;
     decltype(&cdsp_vpp_release) release = nullptr;
-    decltype(&cdsp_vpp_scale) scale = nullptr;
+    decltype(&cdsp_vpp_process) process = nullptr;
     ~CdspApi() {
         if (library)
             dlclose(library);
@@ -48,7 +48,7 @@ std::shared_ptr<CdspApi> load_cdsp_api() {
     LOAD(destroy)
     LOAD(import)
     LOAD(release)
-    LOAD(scale)
+    LOAD(process)
 #undef LOAD
     cached = api;
     return api;
@@ -70,13 +70,13 @@ void vpp_caps(VAProcPipelineCaps &caps) {
     static VAProcColorStandardType colors[] = {VAProcColorStandardNone, VAProcColorStandardBT601,
                                                VAProcColorStandardBT709, VAProcColorStandardBT2020,
                                                VAProcColorStandardExplicit};
-    static uint32_t formats[] = {VA_FOURCC_NV12};
+    static uint32_t formats[] = {VA_FOURCC_NV12, VA_FOURCC_P010};
     caps = {};
     caps.input_color_standards = caps.output_color_standards = colors;
     caps.num_input_color_standards = caps.num_output_color_standards =
         sizeof(colors) / sizeof(colors[0]);
     caps.input_pixel_format = caps.output_pixel_format = formats;
-    caps.num_input_pixel_formats = caps.num_output_pixel_formats = 1;
+    caps.num_input_pixel_formats = caps.num_output_pixel_formats = 2;
     caps.min_input_width = caps.min_output_width = 16;
     caps.min_input_height = caps.min_output_height = 2;
     caps.max_input_width = caps.max_output_width = 8192;
@@ -91,7 +91,8 @@ VppPicture vpp_picture(const Buffer &buffer, const std::shared_ptr<Surface> &sou
               !(p.pipeline_flags & ~VA_PROC_PIPELINE_FAST) &&
               !(p.filter_flags & ~VA_FILTER_SCALING_MASK) && !p.input_surface_flag &&
               !p.output_surface_flag && !p.output_hdr_metadata,
-          "VPP supports progressive scaling only", VA_STATUS_ERROR_UNIMPLEMENTED);
+          "VPP supports progressive scaling and bit-depth conversion only",
+          VA_STATUS_ERROR_UNIMPLEMENTED);
     const auto &in = p.input_color_properties;
     const auto &out = p.output_color_properties;
     auto matches = [](unsigned a, unsigned b) { return !a || !b || a == b; };
@@ -124,9 +125,10 @@ VppPicture vpp_picture(const Buffer &buffer, const std::shared_ptr<Surface> &sou
               uint64_t(target.height) * 20 >= r.height,
           "VPP cannot mix up/down scaling axes or downscale beyond 20:1",
           VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
-    check(source.get() != &target && source->fourcc == VA_FOURCC_NV12 &&
-              target.fourcc == VA_FOURCC_NV12,
-          "VPP requires distinct NV12 surfaces", VA_STATUS_ERROR_INVALID_SURFACE);
+    check(source.get() != &target &&
+              (source->fourcc == VA_FOURCC_NV12 || source->fourcc == VA_FOURCC_P010) &&
+              (target.fourcc == VA_FOURCC_NV12 || target.fourcc == VA_FOURCC_P010),
+          "VPP requires distinct NV12/P010 surfaces", VA_STATUS_ERROR_INVALID_SURFACE);
     return picture;
 }
 #ifdef HAVE_CDSP_VPP
@@ -136,7 +138,9 @@ std::shared_ptr<Memory> allocate_vpp_memory(const Surface &surface) {
     memory->origin = MemoryOrigin::DmaHeap;
     memory->width = surface.width;
     memory->height = surface.height;
-    memory->stride = (surface.width + 127) & ~127u;
+    memory->fourcc = surface.fourcc;
+    unsigned bytes = surface.fourcc == VA_FOURCC_P010 ? 2 : 1;
+    memory->stride = (surface.width * bytes + 127) & ~127u;
     memory->storage_height = (surface.height + 31) & ~31u;
     memory->size = (size_t(memory->stride) * memory->storage_height * 3 / 2 + 4095) & ~size_t(4095);
     int heap = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
@@ -152,13 +156,14 @@ std::shared_ptr<Memory> allocate_vpp_memory(const Surface &surface) {
 }
 cdsp_vpp_frame import_vpp_frame(Memory &memory, const Surface &surface,
                                 const std::shared_ptr<CdspApi> &api) {
-    check(memory.fd >= 0 && memory.fourcc == VA_FOURCC_NV12 && memory.size <= INT_MAX &&
+    unsigned row_bytes = surface.width * (surface.fourcc == VA_FOURCC_P010 ? 2 : 1);
+    check(memory.fd >= 0 && memory.fourcc == surface.fourcc && memory.size <= INT_MAX &&
               memory.width >= surface.width && memory.height >= surface.height &&
-              memory.stride >= surface.width && memory.storage_height >= surface.height &&
+              memory.stride >= row_bytes && memory.storage_height >= surface.height &&
               uint64_t(memory.data_offset) +
                       uint64_t(memory.stride) *
                           (uint64_t(memory.storage_height) + surface.height / 2 - 1) +
-                      surface.width <=
+                      row_bytes <=
                   memory.size,
           "unsupported CDSP DMA-BUF layout", VA_STATUS_ERROR_INVALID_SURFACE);
     if (!memory.vpp_registration) {
@@ -212,7 +217,9 @@ void Vpp::scale(const VppPicture &picture, const std::shared_ptr<Surface> &targe
     auto region = picture.region;
     cdsp_vpp_crop crop{unsigned(region.x), unsigned(region.y), region.width, region.height};
     uint64_t dsp_us = 0;
-    int e = impl_->api->scale(impl_->context, &in, &crop, &out, &dsp_us);
+    int e = impl_->api->process(
+        impl_->context, &in, source->fourcc == VA_FOURCC_P010 ? CDSP_VPP_P010 : CDSP_VPP_NV12,
+        &crop, &out, target->fourcc == VA_FOURCC_P010 ? CDSP_VPP_P010 : CDSP_VPP_NV12, &dsp_us);
     if (e) {
         trace("CDSP VPP scale failed: %d", e);
         throw Error(VA_STATUS_ERROR_OPERATION_FAILED, "CDSP VPP scaling failed");

@@ -39,11 +39,17 @@ int cdsp_vpp_profile(cdsp_vpp_context *ctx, int enable,
 int cdsp_vpp_import(int fd, size_t size, cdsp_vpp_buffer **out);
 void cdsp_vpp_release(cdsp_vpp_buffer *buffer);
 // The map is provided for diagnostic CPU access only; pair access with
-// DMA_BUF_IOCTL_SYNC. Scaling performs no CPU access to frame pixels.
+// DMA_BUF_IOCTL_SYNC. Processing performs no CPU access to frame pixels.
 void *cdsp_vpp_buffer_map(cdsp_vpp_buffer *buffer);
 int cdsp_vpp_buffer_fd(const cdsp_vpp_buffer *buffer); // borrowed fd
 int cdsp_vpp_scale(cdsp_vpp_context *ctx, const cdsp_vpp_frame *src, const cdsp_vpp_crop *crop,
                    const cdsp_vpp_frame *dst, uint64_t *dsp_usec);
+// Formats are CDSP_VPP_NV12/P010; strides and offsets are always in bytes.
+// NV12 -> P010 shifts each byte left by 8. P010 -> NV12 rounds and saturates;
+// color range and matrix are unchanged. cdsp_vpp_scale is the NV12-only wrapper.
+int cdsp_vpp_process(cdsp_vpp_context *ctx, const cdsp_vpp_frame *src, int src_format,
+                     const cdsp_vpp_crop *crop, const cdsp_vpp_frame *dst, int dst_format,
+                     uint64_t *dsp_usec);
 #ifdef __cplusplus
 }
 #endif

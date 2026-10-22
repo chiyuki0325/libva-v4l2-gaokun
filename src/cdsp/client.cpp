@@ -142,15 +142,20 @@ extern "C" void *cdsp_vpp_buffer_map(cdsp_vpp_buffer *buffer) {
 extern "C" int cdsp_vpp_buffer_fd(const cdsp_vpp_buffer *buffer) {
     return buffer ? buffer->fd : -1;
 }
-static bool valid_frame(const cdsp_vpp_frame &frame) {
+static bool valid_frame(const cdsp_vpp_frame &frame, int format) {
+    if (format != CDSP_VPP_NV12 && format != CDSP_VPP_P010)
+        return false;
+    unsigned bytes = format == CDSP_VPP_P010 ? 2 : 1;
     if (!frame.buffer || frame.width < 16 || frame.width > 8192 || frame.height < 2 ||
         frame.height > 8192 || (frame.width & 15) || (frame.height & 1) ||
-        frame.stride < frame.width || frame.stride > INT_MAX || frame.y_offset > INT_MAX ||
-        frame.uv_offset > INT_MAX)
+        frame.stride < frame.width * bytes || frame.stride > INT_MAX || frame.y_offset > INT_MAX ||
+        frame.uv_offset > INT_MAX ||
+        ((frame.stride | frame.y_offset | frame.uv_offset) & (bytes - 1)))
         return false;
-    uint64_t y_end = frame.y_offset + (uint64_t)(frame.height - 1) * frame.stride + frame.width;
+    uint64_t y_end =
+        frame.y_offset + (uint64_t)(frame.height - 1) * frame.stride + frame.width * bytes;
     uint64_t uv_end =
-        frame.uv_offset + (uint64_t)(frame.height / 2 - 1) * frame.stride + frame.width;
+        frame.uv_offset + (uint64_t)(frame.height / 2 - 1) * frame.stride + frame.width * bytes;
     return y_end <= frame.buffer->size && uv_end <= frame.buffer->size &&
            (y_end <= frame.uv_offset || uv_end <= frame.y_offset);
 }
@@ -188,7 +193,13 @@ extern "C" int cdsp_vpp_profile(cdsp_vpp_context *ctx, int enable,
 }
 extern "C" int cdsp_vpp_scale(cdsp_vpp_context *ctx, const cdsp_vpp_frame *src,
                               const cdsp_vpp_crop *crop, const cdsp_vpp_frame *dst, uint64_t *us) {
-    if (!ctx || !src || !dst || !us || !valid_frame(*src) || !valid_frame(*dst))
+    return cdsp_vpp_process(ctx, src, CDSP_VPP_NV12, crop, dst, CDSP_VPP_NV12, us);
+}
+extern "C" int cdsp_vpp_process(cdsp_vpp_context *ctx, const cdsp_vpp_frame *src, int src_format,
+                                const cdsp_vpp_crop *crop, const cdsp_vpp_frame *dst,
+                                int dst_format, uint64_t *us) {
+    if (!ctx || !src || !dst || !us || !valid_frame(*src, src_format) ||
+        !valid_frame(*dst, dst_format))
         return -EINVAL;
     auto &src_buffer = *src->buffer;
     auto &dst_buffer = *dst->buffer;
@@ -224,9 +235,11 @@ extern "C" int cdsp_vpp_scale(cdsp_vpp_context *ctx, const cdsp_vpp_frame *src,
         ctx->dst_width = dst->width;
         ctx->dst_height = dst->height;
     }
-    return iris_vpp_run(ctx->handle, (const uint8_t *)src_buffer.map, (int)src_buffer.size,
-                        (uint8_t *)dst_buffer.map, (int)dst_buffer.size, src->stride, dst->stride,
-                        src->y_offset + (uint64_t)region.y * src->stride + region.x,
-                        src->uv_offset + (uint64_t)(region.y / 2) * src->stride + region.x,
-                        dst->y_offset, dst->uv_offset, ctx->workers, us);
+    unsigned src_bytes = src_format == CDSP_VPP_P010 ? 2 : 1;
+    return iris_vpp_process(
+        ctx->handle, (const uint8_t *)src_buffer.map, (int)src_buffer.size,
+        (uint8_t *)dst_buffer.map, (int)dst_buffer.size, src->stride, dst->stride,
+        src->y_offset + (uint64_t)region.y * src->stride + region.x * src_bytes,
+        src->uv_offset + (uint64_t)(region.y / 2) * src->stride + region.x * src_bytes,
+        dst->y_offset, dst->uv_offset, ctx->workers, src_format, dst_format, us);
 }

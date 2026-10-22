@@ -20,8 +20,8 @@ providing hardware decoding and encoding on **SC8280XP**, tested on
 - Compatible DMA-BUF paths avoid raw-frame copies; cached surfaces may need
   GPU or CPU copying. PRIME1/PRIME2 import accepts single-buffer linear
   NV12/P010; export uses PRIME2.
-- Optional CDSP VPP: NV12 scaling and cropping with persistent DMA-BUF
-  mappings and no CPU pixel copies.
+- Optional CDSP VPP: NV12/P010 scaling, cropping and bit-depth conversion with
+  persistent DMA-BUF mappings and no CPU pixel copies.
 - Identified decode errors produce gray frames with the Iris error-timestamp
   patch below; stalls remain errors.
 
@@ -93,10 +93,11 @@ Meson downloads pinned QAIC and Hexagon Open Access **19.0.02**, using system
 FastRPC or a source fallback. No full SDK is needed. Arch packaging enables CDSP;
 Debian disables it. See [CDSP build and runtime requirements](src/cdsp/README.md).
 
-NV12→NV12 only: widths/crop x aligned to 16 pixels, heights/crop y to 2,
-maximum dimension 8192, reduction up to 20:1, both axes scaling in the same
-direction. No color conversion, rotation, interlacing, blending or partial
-output regions. Active workers follow the available HVX count, up to eight.
+NV12/P010 scaling and conversion: widths/crop x aligned to 16 pixels,
+heights/crop y to 2, maximum dimension 8192, reduction up to 20:1, both axes
+scaling in the same direction. Color matrix/range is preserved; no rotation,
+interlacing, blending or partial output regions. Active workers follow the
+available HVX count, up to eight.
 
 ```sh
 ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \

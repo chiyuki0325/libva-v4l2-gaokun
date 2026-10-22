@@ -152,6 +152,10 @@ static unsigned profile_format(VAProfile p) {
     // This also applies to future 10-bit profiles other than VP9_2.
     return is_10bit(p) * VA_RT_FORMAT_YUV420_10 | !is_vp9_2 * VA_RT_FORMAT_YUV420;
 }
+static unsigned render_formats(VAProfile profile, VAEntrypoint entrypoint) {
+    return entrypoint == VAEntrypointVideoProc ? (VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10)
+                                             : profile_format(profile);
+}
 static unsigned profile_fourcc(VAProfile p) {
     return is_10bit(p) ? VA_FOURCC_P010 : VA_FOURCC_NV12;
 }
@@ -272,7 +276,7 @@ API(
           "unsupported entrypoint", VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT);
     for (int i = 0; i < count; ++i) {
         if (entry == VAEntrypointVideoProc) {
-            attrs[i].value = attrs[i].type == VAConfigAttribRTFormat ? VA_RT_FORMAT_YUV420
+            attrs[i].value = attrs[i].type == VAConfigAttribRTFormat ? render_formats(profile, entry)
                              : (attrs[i].type == VAConfigAttribMaxPictureWidth ||
                                 attrs[i].type == VAConfigAttribMaxPictureHeight)
                                  ? 8192
@@ -325,7 +329,7 @@ API(
                 config.rate_control = attrs[i].value;
             }
         } else if (attrs[i].type == VAConfigAttribRTFormat)
-            check(attrs[i].value && !(attrs[i].value & ~profile_format(p)),
+            check(attrs[i].value && !(attrs[i].value & ~render_formats(p, e)),
                   "unsupported render format", VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
         else if (e == VAEntrypointVLD && attrs[i].type == VAConfigAttribDecSliceMode)
             check(attrs[i].value == VA_DEC_SLICE_MODE_NORMAL, "unsupported slice mode",
@@ -341,7 +345,7 @@ API(query_config,
     (VADriverContextP ctx, VAConfigID id, VAProfile *p, VAEntrypoint *e, VAConfigAttrib *a, int *n),
     auto config = lookup(d.configs, id, VA_STATUS_ERROR_INVALID_CONFIG);
     *p = config.profile; *e = config.entrypoint;
-    a[0] = {VAConfigAttribRTFormat, profile_format(*p)}; *n = 1;
+    a[0] = {VAConfigAttribRTFormat, render_formats(*p, *e)}; *n = 1;
     if (*e == VAEntrypointEncSlice) a[(*n)++] = {VAConfigAttribRateControl, config.rate_control};
     return VA_STATUS_SUCCESS;)
 API(
@@ -370,7 +374,10 @@ API(
         a[i].value.type = VAGenericValueTypeInteger;
         a[i].value.value.i = values[i];
     } unsigned n = 6;
-    if (values[0] != VA_FOURCC_NV12 && (profile_format(profile) & VA_RT_FORMAT_YUV420)) {
+    if (config.entrypoint == VAEntrypointVideoProc) {
+        a[n] = a[0];
+        a[n++].value.value.i = VA_FOURCC_P010;
+    } else if (values[0] != VA_FOURCC_NV12 && (profile_format(profile) & VA_RT_FORMAT_YUV420)) {
         a[n] = a[0];
         a[n++].value.value.i = VA_FOURCC_NV12;
     } if (!attrs) {
@@ -628,7 +635,10 @@ API(
     // render targets. Keep it fixed for the lifetime of the decoder.
     if (c->entrypoint == VAEntrypointVLD && c->profile == VAProfileHEVCMain10 && !c->decoder)
         c->internal_profile = s->fourcc == VA_FOURCC_NV12 ? VAProfileHEVCMain : VAProfileHEVCMain10;
-    check(s->fourcc == profile_fourcc(c->internal_profile), "surface format does not match context",
+    check(c->entrypoint == VAEntrypointVideoProc
+              ? (s->fourcc == VA_FOURCC_NV12 || s->fourcc == VA_FOURCC_P010)
+              : s->fourcc == profile_fourcc(c->internal_profile),
+          "surface format does not match context",
           VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
     // Defer decoder creation until the target surface format is known.
     if (c->entrypoint == VAEntrypointVLD && !c->decoder) {
