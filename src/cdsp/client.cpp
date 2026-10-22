@@ -146,8 +146,8 @@ static bool valid_frame(const cdsp_vpp_frame &frame, int format) {
     if (format != CDSP_VPP_NV12 && format != CDSP_VPP_P010)
         return false;
     unsigned bytes = format == CDSP_VPP_P010 ? 2 : 1;
-    if (!frame.buffer || frame.width < 16 || frame.width > 8192 || frame.height < 2 ||
-        frame.height > 8192 || (frame.width & 15) || (frame.height & 1) ||
+    if (!frame.buffer || frame.width < 2 || frame.width > 8192 || frame.height < 2 ||
+        frame.height > 8192 || (frame.width & 1) || (frame.height & 1) ||
         frame.stride < frame.width * bytes || frame.stride > INT_MAX || frame.y_offset > INT_MAX ||
         frame.uv_offset > INT_MAX ||
         ((frame.stride | frame.y_offset | frame.uv_offset) & (bytes - 1)))
@@ -198,6 +198,14 @@ extern "C" int cdsp_vpp_scale(cdsp_vpp_context *ctx, const cdsp_vpp_frame *src,
 extern "C" int cdsp_vpp_process(cdsp_vpp_context *ctx, const cdsp_vpp_frame *src, int src_format,
                                 const cdsp_vpp_crop *crop, const cdsp_vpp_frame *dst,
                                 int dst_format, uint64_t *us) {
+    return cdsp_vpp_transform(ctx, src, src_format, crop, dst, dst_format, CDSP_VPP_ROTATE_NONE,
+                              us);
+}
+extern "C" int cdsp_vpp_transform(cdsp_vpp_context *ctx, const cdsp_vpp_frame *src, int src_format,
+                                  const cdsp_vpp_crop *crop, const cdsp_vpp_frame *dst,
+                                  int dst_format, int rotation, uint64_t *us) {
+    if (rotation < CDSP_VPP_ROTATE_NONE || rotation > CDSP_VPP_ROTATE_270)
+        return -EINVAL;
     if (!ctx || !src || !dst || !us || !valid_frame(*src, src_format) ||
         !valid_frame(*dst, dst_format))
         return -EINVAL;
@@ -205,13 +213,15 @@ extern "C" int cdsp_vpp_process(cdsp_vpp_context *ctx, const cdsp_vpp_frame *src
     auto &dst_buffer = *dst->buffer;
     if (src_buffer.dev == dst_buffer.dev && src_buffer.ino == dst_buffer.ino)
         return -EINVAL;
+    unsigned scaled_width = (rotation & 1) ? dst->height : dst->width;
+    unsigned scaled_height = (rotation & 1) ? dst->width : dst->height;
     cdsp_vpp_crop region = crop ? *crop : cdsp_vpp_crop{0, 0, src->width, src->height};
-    if (!region.width || !region.height || ((region.x | region.width) & 15) ||
+    if (!region.width || !region.height || ((region.x | region.width) & 1) ||
         ((region.y | region.height) & 1) || (uint64_t)region.x + region.width > src->width ||
-        (uint64_t)region.y + region.height > src->height || region.width > 20u * dst->width ||
-        region.height > 20u * dst->height ||
-        !((region.width >= dst->width && region.height >= dst->height) ||
-          (region.width <= dst->width && region.height <= dst->height)))
+        (uint64_t)region.y + region.height > src->height || region.width > 20u * scaled_width ||
+        region.height > 20u * scaled_height ||
+        !((region.width >= scaled_width && region.height >= scaled_height) ||
+          (region.width <= scaled_width && region.height <= scaled_height)))
         return -EINVAL;
     std::lock_guard<std::mutex> guard(ctx->lock);
     int e = wait_dma_buf_access(src_buffer.fd, POLLIN);
@@ -225,21 +235,22 @@ extern "C" int cdsp_vpp_process(cdsp_vpp_context *ctx, const cdsp_vpp_frame *src
     if (e)
         return e;
     if (ctx->src_width != region.width || ctx->src_height != region.height ||
-        ctx->dst_width != dst->width || ctx->dst_height != dst->height) {
-        e = iris_vpp_configure(ctx->handle, region.width, region.height, dst->width, dst->height);
+        ctx->dst_width != scaled_width || ctx->dst_height != scaled_height) {
+        e = iris_vpp_configure(ctx->handle, region.width, region.height, scaled_width,
+                               scaled_height);
         ctx->src_width = ctx->src_height = ctx->dst_width = ctx->dst_height = 0;
         if (e)
             return e;
         ctx->src_width = region.width;
         ctx->src_height = region.height;
-        ctx->dst_width = dst->width;
-        ctx->dst_height = dst->height;
+        ctx->dst_width = scaled_width;
+        ctx->dst_height = scaled_height;
     }
     unsigned src_bytes = src_format == CDSP_VPP_P010 ? 2 : 1;
-    return iris_vpp_process(
+    return iris_vpp_transform(
         ctx->handle, (const uint8_t *)src_buffer.map, (int)src_buffer.size,
         (uint8_t *)dst_buffer.map, (int)dst_buffer.size, src->stride, dst->stride,
         src->y_offset + (uint64_t)region.y * src->stride + region.x * src_bytes,
         src->uv_offset + (uint64_t)(region.y / 2) * src->stride + region.x * src_bytes,
-        dst->y_offset, dst->uv_offset, ctx->workers, src_format, dst_format, us);
+        dst->y_offset, dst->uv_offset, ctx->workers, src_format, dst_format, rotation, us);
 }

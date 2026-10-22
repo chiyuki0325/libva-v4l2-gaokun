@@ -83,7 +83,7 @@ export ADSP_LIBRARY_PATH="$PWD/build/src/cdsp${ADSP_LIBRARY_PATH:+;$ADSP_LIBRARY
 ./build/vpp-scaling
 ```
 
-Checks NV12/P010 scaling and conversion, rounding, crop/output layouts,
+Checks NV12/P010 scaling, conversion and rotation, rounding, crop/output layouts,
 DMA-BUF identity, persistent mapping and context/buffer lifetime. Also run
 against a `-Dfastrpc=bundled` build.
 

@@ -240,6 +240,7 @@ void vpp_caps(VAProcPipelineCaps &caps);
 struct VppPicture {
     std::shared_ptr<Surface> source;
     VARectangle region{};
+    unsigned rotation = VA_ROTATION_NONE;
 };
 class Vpp {
     struct Impl;
@@ -248,7 +249,7 @@ class Vpp {
   public:
     Vpp();
     ~Vpp();
-    void scale(const VppPicture &picture, const std::shared_ptr<Surface> &target);
+    void process(const VppPicture &picture, const std::shared_ptr<Surface> &target);
 };
 VppPicture vpp_picture(const Buffer &buffer, const std::shared_ptr<Surface> &source,
                        const Surface &target);

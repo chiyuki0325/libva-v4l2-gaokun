@@ -50,6 +50,11 @@ int cdsp_vpp_scale(cdsp_vpp_context *ctx, const cdsp_vpp_frame *src, const cdsp_
 int cdsp_vpp_process(cdsp_vpp_context *ctx, const cdsp_vpp_frame *src, int src_format,
                      const cdsp_vpp_crop *crop, const cdsp_vpp_frame *dst, int dst_format,
                      uint64_t *dsp_usec);
+// Clockwise CDSP_VPP_ROTATE_* rotation. Destination dimensions describe the
+// final rotated image; cropping uses source coordinates. All geometry is even.
+int cdsp_vpp_transform(cdsp_vpp_context *ctx, const cdsp_vpp_frame *src, int src_format,
+                       const cdsp_vpp_crop *crop, const cdsp_vpp_frame *dst, int dst_format,
+                       int rotation, uint64_t *dsp_usec);
 #ifdef __cplusplus
 }
 #endif

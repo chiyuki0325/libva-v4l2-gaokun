@@ -79,7 +79,7 @@ static void sync(int fd, uint64_t flags) {
 struct Allocation {
     VADRMPRIMESurfaceDescriptor desc{};
     uint8_t *data;
-    Allocation(unsigned w, unsigned h, unsigned format = VA_FOURCC_NV12) {
+    Allocation(unsigned w, unsigned h, unsigned format = VA_FOURCC_NV12, bool tight = false) {
         auto &obj = desc.objects[0];
         auto &l = desc.layers[0];
         desc.fourcc = format;
@@ -88,9 +88,11 @@ struct Allocation {
         desc.height = h;
         desc.num_objects = desc.num_layers = 1;
         l.num_planes = 2;
-        l.pitch[0] = l.pitch[1] = (w * (format == VA_FOURCC_P010 ? 2 : 1) + 127) & ~127u;
-        l.offset[0] = 128; // Nonzero base offset and padded Y rows are intentional.
-        l.offset[1] = 128 + l.pitch[0] * ((h + 31) & ~31u);
+        unsigned row_bytes = w * (format == VA_FOURCC_P010 ? 2 : 1);
+        l.pitch[0] = l.pitch[1] = tight ? row_bytes : (row_bytes + 127) & ~127u;
+        // Exercise both padded imports and planes ending at the DMA-BUF boundary.
+        l.offset[0] = tight ? 0 : 128;
+        l.offset[1] = l.offset[0] + l.pitch[0] * (tight ? h : (h + 31) & ~31u);
         obj.size = (l.offset[1] + l.pitch[1] * ((h + 1) / 2) + 4095) & ~4095u;
         obj.drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
         int heap = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
@@ -134,10 +136,12 @@ struct Case {
     unsigned sw, sh, dw, dh;
     bool crop;
     unsigned src_format = VA_FOURCC_NV12, dst_format = VA_FOURCC_NV12;
+    unsigned rotation = VA_ROTATION_NONE;
+    bool tight = false;
 };
 static void run_case(Case c) {
-    Allocation input(c.sw, c.sh, c.src_format), reference(c.dw, c.dh, c.dst_format),
-        destination(c.dw, c.dh, c.dst_format);
+    Allocation input(c.sw, c.sh, c.src_format, c.tight), reference(c.dw, c.dh, c.dst_format),
+        destination(c.dw, c.dh, c.dst_format, c.tight);
     bool wide = c.src_format == VA_FOURCC_P010 || c.dst_format == VA_FOURCC_P010;
     auto &sl = input.desc.layers[0];
     sync(input.desc.objects[0].fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
@@ -159,15 +163,17 @@ static void run_case(Case c) {
                        static_cast<uint16_t>(c.crop ? 360 : c.sh)};
     sync(input.desc.objects[0].fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
     sync(reference.desc.objects[0].fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
-    bool enlarging = region.width < c.dw || region.height < c.dh;
+    unsigned scaled_width = (c.rotation & 1) ? c.dh : c.dw;
+    unsigned scaled_height = (c.rotation & 1) ? c.dw : c.dh;
+    bool enlarging = region.width < scaled_width || region.height < scaled_height;
     std::vector<int> row(region.width);
     for (unsigned p = 0; p < 2; ++p) {
         int channels = p ? 2 : 1;
         const auto *src = input.data + sl.offset[p] + (region.y / channels) * sl.pitch[p] +
                           region.x * (c.src_format == VA_FOURCC_P010 ? 2 : 1);
         auto *dst = reference.data + reference.desc.layers[0].offset[p];
-        for (unsigned y = 0; y < c.dh / channels; ++y) {
-            auto fy = make_filter(region.height / channels, c.dh / channels, y);
+        for (unsigned y = 0; y < scaled_height / channels; ++y) {
+            auto fy = make_filter(region.height / channels, scaled_height / channels, y);
             for (unsigned x = 0; x < region.width; ++x) {
                 int sum = 0;
                 for (int k = 0; k < fy.tap_count; ++k) {
@@ -183,19 +189,30 @@ static void run_case(Case c) {
                     row[x] = enlarging ? (sum + (1 << (fy.shift - 7))) >> (fy.shift - 6)
                                        : round_clip_u8(sum, fy.shift);
             }
-            for (unsigned x = 0; x < c.dw / channels; ++x) {
-                auto fx = make_filter(region.width / channels, c.dw / channels, x);
+            for (unsigned x = 0; x < scaled_width / channels; ++x) {
+                auto fx = make_filter(region.width / channels, scaled_width / channels, x);
                 for (int ch = 0; ch < channels; ++ch) {
                     int sum = 0;
                     for (int k = 0; k < fx.tap_count; ++k)
                         sum += row[fx.indices[k] * channels + ch] * fx.weights[k];
-                    auto *line = dst + y * reference.desc.layers[0].pitch[p];
+                    unsigned ox = x, oy = y;
+                    if (c.rotation == VA_ROTATION_90) {
+                        ox = scaled_height / channels - 1 - y;
+                        oy = x;
+                    } else if (c.rotation == VA_ROTATION_180) {
+                        ox = scaled_width / channels - 1 - x;
+                        oy = scaled_height / channels - 1 - y;
+                    } else if (c.rotation == VA_ROTATION_270) {
+                        ox = y;
+                        oy = scaled_width / channels - 1 - x;
+                    }
+                    auto *line = dst + oy * reference.desc.layers[0].pitch[p];
                     int shift = fx.shift + (wide ? 4 : enlarging ? 6 : 0);
                     if (c.dst_format == VA_FOURCC_P010)
-                        reinterpret_cast<uint16_t *>(line)[x * channels + ch] =
+                        reinterpret_cast<uint16_t *>(line)[ox * channels + ch] =
                             clamp_int((sum + (1 << (shift - 1))) >> shift, 0, 1023) << 6;
                     else
-                        line[x * channels + ch] = round_clip_u8(sum, shift + (wide ? 2 : 0));
+                        line[ox * channels + ch] = round_clip_u8(sum, shift + (wide ? 2 : 0));
                 }
             }
         }
@@ -237,6 +254,9 @@ static void run_case(Case c) {
                 caps.input_pixel_format[1] == VA_FOURCC_P010 &&
                 caps.output_pixel_format[1] == VA_FOURCC_P010,
             "NV12/P010 capability values");
+    require(caps.rotation_flags == ((1 << VA_ROTATION_NONE) | (1 << VA_ROTATION_90) |
+                                    (1 << VA_ROTATION_180) | (1 << VA_ROTATION_270)),
+            "rotation capabilities");
     auto in = import(display, input.desc);
     // Test composed and separate-layer PRIME2 imports.
     auto separate = destination.desc;
@@ -269,6 +289,7 @@ static void run_case(Case c) {
         for (int repeat = 0; repeat < 3; ++repeat) {
             VAProcPipelineParameterBuffer params{};
             params.surface = in;
+            params.rotation_state = c.rotation;
             params.surface_region = &region;
             VABufferID buffer;
             va(vaCreateBuffer(display, context, VAProcPipelineParameterBufferType, sizeof(params),
@@ -316,10 +337,11 @@ static void run_case(Case c) {
         sync(reference.desc.objects[0].fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
         va(vaUnmapBuffer(display, image.buf));
         va(vaDestroyImage(display, image.image_id));
-        std::printf("%s -> %s %ux%u -> %ux%u crop=%d output=%u RPC=%d maxdiff Y=%u UV=%u\n",
-                    c.src_format == VA_FOURCC_P010 ? "P010" : "NV12",
-                    c.dst_format == VA_FOURCC_P010 ? "P010" : "NV12", c.sw, c.sh, c.dw, c.dh,
-                    c.crop, kind, direct_calls, maxdiff[0], maxdiff[1]);
+        std::printf(
+            "%s -> %s %ux%u -> %ux%u crop=%d rotation=%u output=%u RPC=%d maxdiff Y=%u UV=%u\n",
+            c.src_format == VA_FOURCC_P010 ? "P010" : "NV12",
+            c.dst_format == VA_FOURCC_P010 ? "P010" : "NV12", c.sw, c.sh, c.dw, c.dh, c.crop,
+            c.rotation * 90, kind, direct_calls, maxdiff[0], maxdiff[1]);
         require(maxdiff[0] <= unsigned(wide ? 0 : 1) && maxdiff[1] <= unsigned(wide ? 0 : 1),
                 "DSP matches CPU reference within rounding tolerance");
         close(exported.objects[0].fd);
@@ -327,13 +349,13 @@ static void run_case(Case c) {
     // Unsupported operations must fail before a DSP invocation.
     VAProcPipelineParameterBuffer bad{};
     bad.surface = in;
-    bad.rotation_state = VA_ROTATION_90;
+    bad.rotation_state = VA_ROTATION_270 + 1;
     VABufferID buffer;
     va(vaCreateBuffer(display, context, VAProcPipelineParameterBufferType, sizeof(bad), 1, &bad,
                       &buffer));
     va(vaBeginPicture(display, context, outputs[0]));
-    require(vaRenderPicture(display, context, &buffer, 1) == VA_STATUS_ERROR_UNIMPLEMENTED,
-            "reject rotation");
+    require(vaRenderPicture(display, context, &buffer, 1) == VA_STATUS_ERROR_INVALID_PARAMETER,
+            "reject invalid rotation");
     require(vaEndPicture(display, context) == VA_STATUS_ERROR_INVALID_PARAMETER,
             "reject missing parameters");
     va(vaDestroyBuffer(display, buffer));
@@ -357,6 +379,7 @@ static void run_case(Case c) {
     VAProcPipelineParameterBuffer again{};
     again.surface = in;
     again.surface_region = &region;
+    again.rotation_state = c.rotation;
     va(vaCreateBuffer(display, context, VAProcPipelineParameterBufferType, sizeof(again), 1, &again,
                       &buffer));
     va(vaBeginPicture(display, context, outputs[0]));
@@ -469,61 +492,83 @@ static void check_buffer_lifetime() {
     puts("PASS: buffer lifetime, changing pixels, padding, duplicate imports and profiling");
 }
 
-static void check_conversion_boundaries() {
-    constexpr size_t size = 8192;
+static void check_transform_boundaries() {
+    constexpr size_t size = 16384;
     auto *source = import_test_buffer(size), *target = import_test_buffer(size);
     cdsp_vpp_frame src{source, 288, 8, 600, 16, 16 + 600 * 8};
     cdsp_vpp_frame dst{target, 272, 4, 584, 32, 32 + 584 * 6};
-    cdsp_vpp_crop crop{16, 2, 272, 4};
-    for (int workers : {0, CDSP_VPP_MAX_WORKERS}) {
+    cdsp_vpp_crop crop{2, 2, 272, 4};
+    for (int workers : {0, 1, CDSP_VPP_MAX_WORKERS}) {
         cdsp_vpp_context *ctx = nullptr;
         require(!cdsp_vpp_create(&ctx, workers, 1), "conversion context");
         for (int sf : {CDSP_VPP_NV12, CDSP_VPP_P010})
-            for (int df : {CDSP_VPP_NV12, CDSP_VPP_P010}) {
-                std::vector<uint8_t> input(size, 0xa5), expected(size, 0xa5);
-                for (unsigned plane = 0; plane < 2; plane++) {
-                    unsigned channels = plane ? 2 : 1;
-                    for (unsigned y = 0; y < src.height / channels; y++)
-                        for (unsigned x = 0; x < src.width; x++) {
-                            unsigned value = (x + y * src.width + plane * 71) & (sf ? 1023 : 255);
-                            auto *row = input.data() + (plane ? src.uv_offset : src.y_offset) +
-                                        y * src.stride;
-                            if (sf)
-                                reinterpret_cast<uint16_t *>(row)[x] = value << 6;
-                            else
-                                row[x] = value;
-                        }
-                    for (unsigned y = 0; y < dst.height / channels; y++)
-                        for (unsigned x = 0; x < dst.width; x++) {
-                            const auto *row = input.data() +
-                                              (plane ? src.uv_offset : src.y_offset) +
-                                              (y + crop.y / channels) * src.stride;
-                            unsigned value =
-                                sf ? reinterpret_cast<const uint16_t *>(row)[x + crop.x] >> 6
-                                   : row[x + crop.x] * 4;
-                            auto *out = expected.data() + (plane ? dst.uv_offset : dst.y_offset) +
-                                        y * dst.stride;
-                            if (df)
-                                reinterpret_cast<uint16_t *>(out)[x] = value << 6;
-                            else
-                                out[x] = std::min((value + 2) / 4, 255u);
-                        }
+            for (int df : {CDSP_VPP_NV12, CDSP_VPP_P010})
+                for (int rotation : {CDSP_VPP_ROTATE_NONE, CDSP_VPP_ROTATE_90, CDSP_VPP_ROTATE_180,
+                                     CDSP_VPP_ROTATE_270}) {
+                    dst = (rotation & 1) ? cdsp_vpp_frame{target, 4, 272, 24, 32, 32 + 24 * 274}
+                                         : cdsp_vpp_frame{target, 272, 4, 584, 32, 32 + 584 * 6};
+                    std::vector<uint8_t> input(size, 0xa5), expected(size, 0xa5);
+                    for (unsigned plane = 0; plane < 2; plane++) {
+                        unsigned channels = plane ? 2 : 1;
+                        for (unsigned y = 0; y < src.height / channels; y++)
+                            for (unsigned x = 0; x < src.width; x++) {
+                                unsigned value =
+                                    (x + y * src.width + plane * 71) & (sf ? 1023 : 255);
+                                auto *row = input.data() + (plane ? src.uv_offset : src.y_offset) +
+                                            y * src.stride;
+                                if (sf)
+                                    reinterpret_cast<uint16_t *>(row)[x] = value << 6;
+                                else
+                                    row[x] = value;
+                            }
+                        for (unsigned y = 0; y < crop.height / channels; y++)
+                            for (unsigned x = 0; x < crop.width; x++) {
+                                const auto *row = input.data() +
+                                                  (plane ? src.uv_offset : src.y_offset) +
+                                                  (y + crop.y / channels) * src.stride;
+                                unsigned value =
+                                    sf ? reinterpret_cast<const uint16_t *>(row)[x + crop.x] >> 6
+                                       : row[x + crop.x] * 4;
+                                unsigned px = x / channels, py = y;
+                                if (rotation == CDSP_VPP_ROTATE_90) {
+                                    px = crop.height / channels - y - 1;
+                                    py = x / channels;
+                                } else if (rotation == CDSP_VPP_ROTATE_180) {
+                                    px = crop.width / channels - x / channels - 1;
+                                    py = crop.height / channels - y - 1;
+                                } else if (rotation == CDSP_VPP_ROTATE_270) {
+                                    px = y;
+                                    py = crop.width / channels - x / channels - 1;
+                                }
+                                auto *out = expected.data() +
+                                            (plane ? dst.uv_offset : dst.y_offset) +
+                                            py * dst.stride;
+                                unsigned component = px * channels + x % channels;
+                                if (df)
+                                    reinterpret_cast<uint16_t *>(out)[component] = value << 6;
+                                else
+                                    out[component] = std::min((value + 2) / 4, 255u);
+                            }
+                    }
+                    sync(cdsp_vpp_buffer_fd(source), DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
+                    memcpy(cdsp_vpp_buffer_map(source), input.data(), size);
+                    sync(cdsp_vpp_buffer_fd(source), DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+                    sync(cdsp_vpp_buffer_fd(target), DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
+                    memset(cdsp_vpp_buffer_map(target), 0xa5, size);
+                    sync(cdsp_vpp_buffer_fd(target), DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+                    uint64_t us;
+                    require(!cdsp_vpp_transform(ctx, &src, sf, &crop, &dst, df, rotation, &us),
+                            "conversion, rotation and format switch");
+                    sync(cdsp_vpp_buffer_fd(target), DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+                    require(!memcmp(cdsp_vpp_buffer_map(target), expected.data(), size),
+                            "conversion values and all padding");
+                    sync(cdsp_vpp_buffer_fd(target), DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
                 }
-                sync(cdsp_vpp_buffer_fd(source), DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
-                memcpy(cdsp_vpp_buffer_map(source), input.data(), size);
-                sync(cdsp_vpp_buffer_fd(source), DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
-                sync(cdsp_vpp_buffer_fd(target), DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
-                memset(cdsp_vpp_buffer_map(target), 0xa5, size);
-                sync(cdsp_vpp_buffer_fd(target), DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
-                uint64_t us;
-                require(!cdsp_vpp_process(ctx, &src, sf, &crop, &dst, df, &us),
-                        "conversion and format switch");
-                sync(cdsp_vpp_buffer_fd(target), DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
-                require(!memcmp(cdsp_vpp_buffer_map(target), expected.data(), size),
-                        "conversion values and all padding");
-                sync(cdsp_vpp_buffer_fd(target), DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
-            }
         uint64_t us;
+        for (int rotation : {-1, CDSP_VPP_ROTATE_270 + 1})
+            require(cdsp_vpp_transform(ctx, &src, CDSP_VPP_NV12, &crop, &dst, CDSP_VPP_NV12,
+                                       rotation, &us) != 0,
+                    "reject rotation");
         require(cdsp_vpp_process(ctx, &src, 2, &crop, &dst, CDSP_VPP_NV12, &us) != 0,
                 "reject format");
         auto bad = src;
@@ -538,7 +583,8 @@ static void check_conversion_boundaries() {
     }
     cdsp_vpp_release(target);
     cdsp_vpp_release(source);
-    puts("PASS: conversion rounding, format switches, padding and invalid layouts (scalar/HVX)");
+    puts("PASS: conversion/rotation, format switches, padding and invalid layouts (scalar/1 "
+         "HVX/all HVX)");
 }
 
 int main() {
@@ -567,6 +613,39 @@ int main() {
                 cases.push_back(c);
             }
         }
+    for (unsigned sf : {VA_FOURCC_NV12, VA_FOURCC_P010})
+        for (unsigned df : {VA_FOURCC_NV12, VA_FOURCC_P010})
+            for (unsigned rotation : {VA_ROTATION_90, VA_ROTATION_180, VA_ROTATION_270})
+                for (Case c : {Case{162, 94, 162, 94, false}, Case{80, 18, 160, 36, false},
+                               Case{320, 180, 160, 90, false}, Case{82, 18, 114, 26, false},
+                               Case{640, 384, 320, 180, true}, Case{2, 2, 2, 2, false},
+                               Case{2, 2, 6, 4, false}}) {
+                    c.src_format = sf;
+                    c.dst_format = df;
+                    c.rotation = rotation;
+                    if (rotation & 1)
+                        std::swap(c.dw, c.dh);
+                    cases.push_back(c);
+                }
+    for (unsigned format : {VA_FOURCC_NV12, VA_FOURCC_P010})
+        for (unsigned rotation : {VA_ROTATION_90, VA_ROTATION_180, VA_ROTATION_270}) {
+            Case c{1920, 1080, 1920, 1080, false, format, format, rotation};
+            if (rotation & 1)
+                std::swap(c.dw, c.dh);
+            cases.push_back(c);
+        }
+    cases.push_back(
+        {1080, 1920, 1920, 1080, false, VA_FOURCC_NV12, VA_FOURCC_NV12, VA_ROTATION_90});
+    // Page-ending buffers expose masked vector accesses even with no active
+    // bytes beyond the boundary. Include the portrait 2x transcode geometry.
+    for (unsigned sf : {VA_FOURCC_NV12, VA_FOURCC_P010})
+        for (unsigned df : {VA_FOURCC_NV12, VA_FOURCC_P010}) {
+            cases.push_back({720, 1280, 360, 640, false, sf, df});
+            cases.push_back({64, 128, 96, 192, false, sf, df, VA_ROTATION_NONE, true});
+            cases.push_back({128, 256, 64, 128, false, sf, df, VA_ROTATION_NONE, true});
+            cases.push_back({64, 128, 128, 64, false, sf, df, VA_ROTATION_90, true});
+            cases.push_back({64, 128, 128, 64, false, sf, df, VA_ROTATION_270, true});
+        }
     // FastRPC owns threads and process-global state. Never fork a process
     // that has already initialized them: each case starts in a fresh child.
     for (auto c : cases) {
@@ -580,6 +659,6 @@ int main() {
         require(waitpid(child, &status, 0) == child && status == 0, "test case child");
     }
     check_buffer_lifetime();
-    check_conversion_boundaries();
+    check_transform_boundaries();
     std::puts("PASS");
 }

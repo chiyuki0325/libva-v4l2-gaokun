@@ -35,6 +35,8 @@ typedef struct {
     int16_t weights[FILTER_MAX_TAPS][64];
     int src_base, dst_offset, components, tap_count, spans_two_vectors;
 } __attribute__((aligned(128))) WideTile;
+#define ROTATION_ROWS 16
+
 typedef struct ScalerState ScalerState;
 typedef struct {
     ScalerState *state;
@@ -56,6 +58,8 @@ struct ScalerState {
     int16_t *cubic_rows, *wide_rows;
     WideTile *wide_tiles[2];
     int wide_tile_count[2], src_format, dst_format;
+    uint8_t *rotation_rows;
+    int rotation, rotation_stride;
     Worker workers[CDSP_VPP_MAX_WORKERS]; // Spare workers stay asleep.
     int created_workers, stop;
     const uint8_t *src;
@@ -141,6 +145,9 @@ static void clear_filters(ScalerState *state) {
         state->area_tiles[plane_index] = 0;
         state->horizontal_filters[plane_index] = state->vertical_filters[plane_index] = 0;
     }
+    free(state->rotation_rows);
+    state->rotation_rows = 0;
+    state->rotation_stride = 0;
     free(state->wide_rows);
     state->wide_rows = 0;
     free(state->area_rows);
@@ -227,8 +234,8 @@ int iris_vpp_profile(remote_handle64 h, int enable, uint64_t *counters, int coun
 int iris_vpp_configure(remote_handle64 h, int src_width, int src_height, int dst_width,
                        int dst_height) {
     ScalerState *state = (ScalerState *)(uintptr_t)h;
-    if (src_width < 16 || dst_width < 16 || src_height < 2 || dst_height < 2 ||
-        (src_width | dst_width) & 15 || (src_height | dst_height) & 1 || src_width > 8192 ||
+    if (src_width < 2 || dst_width < 2 || src_height < 2 || dst_height < 2 ||
+        (src_width | dst_width) & 1 || (src_height | dst_height) & 1 || src_width > 8192 ||
         src_height > 8192 || dst_width > 8192 || dst_height > 8192 || src_width > dst_width * 20 ||
         src_height > dst_height * 20 ||
         !((src_width >= dst_width && src_height >= dst_height) ||
@@ -473,6 +480,19 @@ fail:
     return AEE_ENOMEMORY;
 }
 typedef HVX_Vector UnalignedVector __attribute__((aligned(1)));
+// Store 1..128 live bytes without issuing an all-false store beyond the
+// buffer's last page. vsetq masks its count to seven bits: 128 is not all-ones.
+static void store_partial_vector(uint8_t *dst, HVX_Vector value, int bytes) {
+    int offset = (uintptr_t)dst & 127, end = offset + bytes;
+    HVX_Vector *aligned = (HVX_Vector *)((uintptr_t)dst & ~(uintptr_t)127);
+    value = Q6_V_vror_VR(value, (128 - offset) & 127);
+    HVX_VectorPred mask = Q6_Q_not_Q(Q6_Q_vsetq_R(offset));
+    if (end < 128)
+        mask = Q6_Q_and_QQ(mask, Q6_Q_vsetq_R(end));
+    Q6_vmem_QRIV(mask, aligned, value);
+    if (end > 128)
+        Q6_vmem_QRIV(Q6_Q_vsetq_R(end - 128), aligned + 1, value);
+}
 // vlut32 selects 32-byte banks. Its inputs are byte-shuffled by the caller;
 // delta routing is the faster path when all requested lanes are conflict-free.
 static inline HVX_Vector gather_bytes(HVX_Vector indices, HVX_Vector lower, HVX_Vector upper,
@@ -733,14 +753,11 @@ static void cubic_horizontal(ScalerState *state, int plane_index, uint8_t *dst, 
 }
 static void scale_cubic_plane(ScalerState *state, const uint8_t *src, uint8_t *dst, int src_stride,
                               int dst_stride, int plane_index, int hvx, int worker_id,
-                              int worker_count) {
+                              int first_row, int end_row) {
     int channels = plane_index ? 2 : 1;
     int16_t *row = (int16_t *)((uint8_t *)state->cubic_rows +
                                worker_id * cubic_row_stride_bytes(state->src_width) + 128);
-    // Integer boundaries partition every output row exactly once, even when
-    // height is not divisible by worker_count or some workers receive no rows.
-    for (int y = (state->dst_height / channels) * worker_id / worker_count;
-         y < (state->dst_height / channels) * (worker_id + 1) / worker_count; y++) {
+    for (int y = first_row; y < end_row; y++) {
         if (hvx && src_stride <= 65535) {
             int ahead = y + 2;
             if (ahead >= state->dst_height / channels)
@@ -761,7 +778,7 @@ static void scale_cubic_plane(ScalerState *state, const uint8_t *src, uint8_t *d
         if (state->profiling)
             state->profile_us[worker_id * 4 + plane_index * 2] += middle - start;
         if (hvx) {
-            cubic_horizontal(state, plane_index, dst + y * dst_stride, row);
+            cubic_horizontal(state, plane_index, dst + (y - first_row) * dst_stride, row);
             if (state->profiling)
                 state->profile_us[worker_id * 4 + plane_index * 2 + 1] +=
                     HAP_perf_get_time_us() - middle;
@@ -773,21 +790,22 @@ static void scale_cubic_plane(ScalerState *state, const uint8_t *src, uint8_t *d
                 int sum = 0;
                 for (int k = 0; k < filter->tap_count; k++)
                     sum += row[filter->indices[k] * channels + ch] * filter->weights[k];
-                dst[y * dst_stride + x * channels + ch] = round_clip_u8(sum, filter->shift + 6);
+                dst[(y - first_row) * dst_stride + x * channels + ch] =
+                    round_clip_u8(sum, filter->shift + 6);
             }
     }
 }
 static void scale_plane(ScalerState *state, const uint8_t *src, uint8_t *dst, int src_stride,
-                        int dst_stride, int plane_index, int hvx, int worker_id, int worker_count) {
+                        int dst_stride, int plane_index, int hvx, int worker_id, int first_row,
+                        int end_row) {
     if (state->cubic_rows) {
         scale_cubic_plane(state, src, dst, src_stride, dst_stride, plane_index, hvx, worker_id,
-                          worker_count);
+                          first_row, end_row);
         return;
     }
     int channels = plane_index ? 2 : 1;
     uint8_t *row = state->area_rows + worker_id * area_row_stride_bytes(state->src_width);
-    for (int y = (state->dst_height / channels) * worker_id / worker_count;
-         y < (state->dst_height / channels) * (worker_id + 1) / worker_count; y++) {
+    for (int y = first_row; y < end_row; y++) {
         if (hvx && src_stride <= 65535) {
             int ahead = y + 2;
             if (ahead >= state->dst_height / channels)
@@ -800,10 +818,11 @@ static void scale_plane(ScalerState *state, const uint8_t *src, uint8_t *dst, in
         if (hvx && state->src_width == state->dst_width && state->src_height == state->dst_height) {
             int x = 0;
             for (; x + 128 <= state->dst_width; x += 128)
-                *(UnalignedVector *)(dst + y * dst_stride + x) =
+                *(UnalignedVector *)(dst + (y - first_row) * dst_stride + x) =
                     *(const UnalignedVector *)(src + y * src_stride + x);
             if (x < state->dst_width)
-                memcpy(dst + y * dst_stride + x, src + y * src_stride + x, state->dst_width - x);
+                memcpy(dst + (y - first_row) * dst_stride + x, src + y * src_stride + x,
+                       state->dst_width - x);
             continue;
         }
         if (hvx && state->src_width == 2 * state->dst_width &&
@@ -819,7 +838,8 @@ static void scale_plane(ScalerState *state, const uint8_t *src, uint8_t *dst, in
                                                       *(const UnalignedVector *)(r1 + 2 * x + 128));
                 HVX_Vector even = plane_index ? Q6_Vh_vpacke_VwVw(b, a) : Q6_Vb_vpacke_VhVh(b, a);
                 HVX_Vector odd = plane_index ? Q6_Vh_vpacko_VwVw(b, a) : Q6_Vb_vpacko_VhVh(b, a);
-                *(UnalignedVector *)(dst + y * dst_stride + x) = Q6_Vub_vavg_VubVub_rnd(even, odd);
+                *(UnalignedVector *)(dst + (y - first_row) * dst_stride + x) =
+                    Q6_Vub_vavg_VubVub_rnd(even, odd);
             }
             if (x < state->dst_width) {
                 // Copy only a partial vector's live input, never read past an
@@ -835,7 +855,7 @@ static void scale_plane(ScalerState *state, const uint8_t *src, uint8_t *dst, in
                 HVX_Vector even = plane_index ? Q6_Vh_vpacke_VwVw(b, a) : Q6_Vb_vpacke_VhVh(b, a);
                 HVX_Vector odd = plane_index ? Q6_Vh_vpacko_VwVw(b, a) : Q6_Vb_vpacko_VhVh(b, a);
                 HVX_Vector out = Q6_Vub_vavg_VubVub_rnd(even, odd);
-                uint8_t *target = dst + y * dst_stride + x;
+                uint8_t *target = dst + (y - first_row) * dst_stride + x;
                 if (!((uintptr_t)target & 127))
                     Q6_vmem_QRIV(Q6_Q_vsetq_R(output_bytes), (HVX_Vector *)target, out);
                 else {
@@ -848,7 +868,7 @@ static void scale_plane(ScalerState *state, const uint8_t *src, uint8_t *dst, in
         area_vertical(src, src_stride, row, state->src_width,
                       &state->vertical_filters[plane_index][y], hvx);
         if (hvx) {
-            area_horizontal(state, plane_index, dst + y * dst_stride, row);
+            area_horizontal(state, plane_index, dst + (y - first_row) * dst_stride, row);
             continue;
         }
         for (int x = 0; x < state->dst_width / channels; x++)
@@ -857,7 +877,8 @@ static void scale_plane(ScalerState *state, const uint8_t *src, uint8_t *dst, in
                 int a = 0;
                 for (int k = 0; k < filter->tap_count; k++)
                     a += row[filter->indices[k] * channels + ch] * filter->weights[k];
-                dst[y * dst_stride + x * channels + ch] = round_clip_u8(a, filter->shift);
+                dst[(y - first_row) * dst_stride + x * channels + ch] =
+                    round_clip_u8(a, filter->shift);
             }
     }
 }
@@ -1021,9 +1042,8 @@ static void wide_downscale_2x_row(ScalerState *state, const uint8_t *r0, const u
                 *(UnalignedVector *)(dst + 2 * x) = Q6_Vh_vasl_VhR(sum, 6);
             } else {
                 sum = Q6_Vuh_vlsr_VuhR(Q6_Vh_vadd_VhVh(sum, Q6_V_vsplat_R(0x00080008)), 4);
-                uint8_t out[128] __attribute__((aligned(128)));
-                *(HVX_Vector *)out = Q6_Vub_vpack_VhVh_sat(Q6_V_vzero(), sum);
-                memcpy(dst + x, out, 64);
+                HVX_Vector out = Q6_Vub_vpack_VhVh_sat(Q6_V_vzero(), sum);
+                store_partial_vector(dst + x, out, 64);
             }
         }
     for (; x < state->dst_width; x++) {
@@ -1041,10 +1061,12 @@ static void wide_downscale_2x_row(ScalerState *state, const uint8_t *r0, const u
             dst[x] = clamp_int((sum + 8) >> 4, 0, 255);
     }
 }
-static void process_plane(ScalerState *state, const uint8_t *src, uint8_t *dst, int src_stride,
-                          int dst_stride, int plane, int hvx, int worker, int workers) {
+static void process_rows(ScalerState *state, const uint8_t *src, uint8_t *dst, int src_stride,
+                         int dst_stride, int plane, int hvx, int worker, int first_row,
+                         int end_row) {
     if (state->src_format == CDSP_VPP_NV12 && state->dst_format == CDSP_VPP_NV12) {
-        scale_plane(state, src, dst, src_stride, dst_stride, plane, hvx, worker, workers);
+        scale_plane(state, src, dst, src_stride, dst_stride, plane, hvx, worker, first_row,
+                    end_row);
         return;
     }
     int height = state->dst_height / (plane ? 2 : 1);
@@ -1055,9 +1077,9 @@ static void process_plane(ScalerState *state, const uint8_t *src, uint8_t *dst, 
                        ? 0
                        : (int16_t *)((uint8_t *)state->wide_rows +
                                      worker * cubic_row_stride_bytes(state->src_width) + 128);
-    for (int y = height * worker / workers; y < height * (worker + 1) / workers; y++) {
+    for (int y = first_row; y < end_row; y++) {
         if (same_size) {
-            convert_row(src + y * src_stride, dst + y * dst_stride, state->dst_width,
+            convert_row(src + y * src_stride, dst + (y - first_row) * dst_stride, state->dst_width,
                         state->src_format, state->dst_format, hvx);
             continue;
         }
@@ -1071,7 +1093,7 @@ static void process_plane(ScalerState *state, const uint8_t *src, uint8_t *dst, 
         }
         if (halve) {
             wide_downscale_2x_row(state, src + 2 * y * src_stride, src + (2 * y + 1) * src_stride,
-                                  dst + y * dst_stride, plane ? 2 : 1, hvx);
+                                  dst + (y - first_row) * dst_stride, plane ? 2 : 1, hvx);
             continue;
         }
         uint64_t start = state->profiling ? HAP_perf_get_time_us() : 0;
@@ -1083,13 +1105,118 @@ static void process_plane(ScalerState *state, const uint8_t *src, uint8_t *dst, 
                           &state->vertical_filters[plane][y], state->src_format, hvx);
         uint64_t middle = state->profiling ? HAP_perf_get_time_us() : 0;
         if (hvx && state->dst_width == 2 * state->src_width)
-            cubic_horizontal_2x(state, plane, dst + y * dst_stride, row);
+            cubic_horizontal_2x(state, plane, dst + (y - first_row) * dst_stride, row);
         else
-            wide_horizontal(state, plane, dst + y * dst_stride, row, hvx);
+            wide_horizontal(state, plane, dst + (y - first_row) * dst_stride, row, hvx);
         if (state->profiling) {
             state->profile_us[worker * 4 + plane * 2] += middle - start;
             state->profile_us[worker * 4 + plane * 2 + 1] += HAP_perf_get_time_us() - middle;
         }
+    }
+}
+// Reverse pixels, treating each interleaved U/V pair as one indivisible unit.
+static void reverse_row(const uint8_t *src, uint8_t *dst, int pixels, int pixel_bytes, int hvx) {
+    int bytes = pixels * pixel_bytes, x = 0;
+    if (hvx) {
+        HVX_Vector control = Q6_V_vsplat_R((128 - pixel_bytes) * 0x01010101u);
+        for (; x + 128 <= bytes; x += 128) {
+            HVX_Vector v = *(const UnalignedVector *)(src + bytes - x - 128);
+            *(UnalignedVector *)(dst + x) = Q6_V_vdelta_VV(v, control);
+        }
+    }
+    for (; x < bytes; x += pixel_bytes)
+        memcpy(dst + x, src + bytes - x - pixel_bytes, pixel_bytes);
+}
+// Transpose 16 rows at a time. Each butterfly stage interleaves increasingly
+// large pixel groups. The resulting vectors contain consecutive columns,
+// each with 16 pixels; U/V and the two bytes of P010 stay together throughout.
+static void rotate_strip(const uint8_t *src, int src_stride, uint8_t *dst, int dst_stride,
+                         int width, int height, int first_row, int rows, int pixel_bytes,
+                         int rotation, int hvx) {
+    if (rotation == CDSP_VPP_ROTATE_180) {
+        for (int y = 0; y < rows; y++)
+            reverse_row(src + y * src_stride, dst + (height - first_row - y - 1) * dst_stride,
+                        width, pixel_bytes, hvx);
+        return;
+    }
+    int clockwise = rotation == CDSP_VPP_ROTATE_90;
+    int column = clockwise ? height - first_row - rows : first_row;
+    if (hvx) {
+        HVX_Vector buffers[2][ROTATION_ROWS];
+        int columns = 128 / pixel_bytes;
+        for (int x = 0; x < width; x += columns) {
+            int count = width - x < columns ? width - x : columns;
+            for (int y = 0; y < ROTATION_ROWS; y++) {
+                buffers[0][y] = Q6_V_vzero();
+                if (y < rows) {
+                    const uint8_t *line =
+                        src + (clockwise ? rows - y - 1 : y) * src_stride + x * pixel_bytes;
+                    if (count == columns)
+                        buffers[0][y] = *(const UnalignedVector *)line;
+                    else
+                        memcpy(&buffers[0][y], line, count * pixel_bytes);
+                }
+            }
+            for (int stage = 0, group = 1; group < ROTATION_ROWS; stage++, group *= 2) {
+                HVX_Vector *in = buffers[stage & 1], *out = buffers[(stage + 1) & 1];
+                for (int base = 0; base < ROTATION_ROWS; base += 2 * group)
+                    for (int i = 0; i < group; i++) {
+                        HVX_VectorPair pair = Q6_W_vshuff_VVR(in[base + i + group], in[base + i],
+                                                              -pixel_bytes * group);
+                        out[base + 2 * i] = Q6_V_lo_W(pair);
+                        out[base + 2 * i + 1] = Q6_V_hi_W(pair);
+                    }
+            }
+            const uint8_t *transposed = (const uint8_t *)buffers[0];
+            for (int i = 0; i < count; i++) {
+                int output_row = clockwise ? x + i : width - x - i - 1;
+                uint8_t *target = dst + output_row * dst_stride + column * pixel_bytes;
+                int source_offset = i * ROTATION_ROWS * pixel_bytes;
+                HVX_Vector values = *(const HVX_Vector *)(transposed + (source_offset & ~127));
+                values = Q6_V_vror_VR(values, source_offset & 127);
+                store_partial_vector(target, values, rows * pixel_bytes);
+            }
+        }
+        return;
+    }
+    for (int x = 0; x < width; x++)
+        for (int y = 0; y < rows; y++) {
+            int output_row = clockwise ? x : width - x - 1;
+            int output_column = clockwise ? height - first_row - y - 1 : first_row + y;
+            memcpy(dst + output_row * dst_stride + output_column * pixel_bytes,
+                   src + y * src_stride + x * pixel_bytes, pixel_bytes);
+        }
+}
+static void process_plane(ScalerState *state, const uint8_t *src, uint8_t *dst, int src_stride,
+                          int dst_stride, int plane, int hvx, int worker, int workers) {
+    int channels = plane ? 2 : 1;
+    int height = state->dst_height / channels;
+    if (!state->rotation) {
+        int first = height * worker / workers, end = height * (worker + 1) / workers;
+        process_rows(state, src, dst + first * dst_stride, src_stride, dst_stride, plane, hvx,
+                     worker, first, end);
+        return;
+    }
+    int pixel_bytes = channels * (state->dst_format == CDSP_VPP_P010 ? 2 : 1);
+    int direct = state->src_format == state->dst_format && state->src_width == state->dst_width &&
+                 state->src_height == state->dst_height;
+    int strips = (height + ROTATION_ROWS - 1) / ROTATION_ROWS;
+    for (int block = strips * worker / workers; block < strips * (worker + 1) / workers; block++) {
+        int first = block * ROTATION_ROWS;
+        int rows = height - first < ROTATION_ROWS ? height - first : ROTATION_ROWS;
+        const uint8_t *input = src;
+        int stride = src_stride;
+        if (!direct) {
+            uint8_t *scratch =
+                state->rotation_rows + worker * ROTATION_ROWS * state->rotation_stride;
+            stride = state->rotation_stride;
+            process_rows(state, src, scratch, src_stride, stride, plane, hvx, worker, first,
+                         first + rows);
+            input = scratch;
+        } else
+            input += first * src_stride;
+        rotate_strip(input, stride, dst, dst_stride, state->dst_width / channels, height, first,
+                     rows, pixel_bytes, state->rotation, hvx);
     }
 }
 static void worker_main(void *opaque) {
@@ -1130,12 +1257,24 @@ int iris_vpp_process(remote_handle64 h, const uint8_t *src, int src_size, uint8_
                      int dst_size, int src_stride, int dst_stride, int src_y_offset,
                      int src_uv_offset, int dst_y_offset, int dst_uv_offset, int worker_count,
                      int src_format, int dst_format, uint64_t *us) {
+    return iris_vpp_transform(h, src, src_size, dst, dst_size, src_stride, dst_stride, src_y_offset,
+                              src_uv_offset, dst_y_offset, dst_uv_offset, worker_count, src_format,
+                              dst_format, CDSP_VPP_ROTATE_NONE, us);
+}
+int iris_vpp_transform(remote_handle64 h, const uint8_t *src, int src_size, uint8_t *dst,
+                       int dst_size, int src_stride, int dst_stride, int src_y_offset,
+                       int src_uv_offset, int dst_y_offset, int dst_uv_offset, int worker_count,
+                       int src_format, int dst_format, int rotation, uint64_t *us) {
+    if (rotation < CDSP_VPP_ROTATE_NONE || rotation > CDSP_VPP_ROTATE_270)
+        return AEE_EBADPARM;
     ScalerState *state = (ScalerState *)(uintptr_t)h;
     if ((src_format != CDSP_VPP_NV12 && src_format != CDSP_VPP_P010) ||
         (dst_format != CDSP_VPP_NV12 && dst_format != CDSP_VPP_P010))
         return AEE_EBADPARM;
     int src_bytes = src_format == CDSP_VPP_P010 ? 2 : 1;
     int dst_bytes = dst_format == CDSP_VPP_P010 ? 2 : 1;
+    int output_width = (rotation & 1) ? state->dst_height : state->dst_width;
+    int output_height = (rotation & 1) ? state->dst_width : state->dst_height;
     if (((src_stride | src_y_offset | src_uv_offset) & (src_bytes - 1)) ||
         ((dst_stride | dst_y_offset | dst_uv_offset) & (dst_bytes - 1)))
         return AEE_EBADPARM;
@@ -1145,11 +1284,12 @@ int iris_vpp_process(remote_handle64 h, const uint8_t *src, int src_size, uint8_
                            state->src_height) ||
         !plane_fits_buffer(src_size, src_uv_offset, src_stride, state->src_width * src_bytes,
                            state->src_height / 2) ||
-        !plane_fits_buffer(dst_size, dst_y_offset, dst_stride, state->dst_width * dst_bytes,
-                           state->dst_height) ||
-        !plane_fits_buffer(dst_size, dst_uv_offset, dst_stride, state->dst_width * dst_bytes,
-                           state->dst_height / 2))
+        !plane_fits_buffer(dst_size, dst_y_offset, dst_stride, output_width * dst_bytes,
+                           output_height) ||
+        !plane_fits_buffer(dst_size, dst_uv_offset, dst_stride, output_width * dst_bytes,
+                           output_height / 2))
         return AEE_EBADPARM;
+    state->rotation = rotation;
     state->src_format = src_format;
     state->dst_format = dst_format;
     if ((src_format == CDSP_VPP_P010 || dst_format == CDSP_VPP_P010) &&
@@ -1158,6 +1298,20 @@ int iris_vpp_process(remote_handle64 h, const uint8_t *src, int src_size, uint8_
         int e = prepare_wide_filters(state);
         if (e)
             return e;
+    }
+    // Conversion/scaling feeds bounded strips, never a second full frame.
+    // Pure same-format rotation can read the mapped source directly.
+    if (rotation && (src_format != dst_format || state->src_width != state->dst_width ||
+                     state->src_height != state->dst_height)) {
+        int stride = (state->dst_width * dst_bytes + 127) & ~127;
+        if (stride > state->rotation_stride) {
+            uint8_t *rows = memalign(128, CDSP_VPP_MAX_WORKERS * ROTATION_ROWS * stride);
+            if (!rows)
+                return AEE_ENOMEMORY;
+            free(state->rotation_rows);
+            state->rotation_rows = rows;
+            state->rotation_stride = stride;
+        }
     }
     uint64_t start_us = HAP_perf_get_time_us();
     if (state->profiling)
