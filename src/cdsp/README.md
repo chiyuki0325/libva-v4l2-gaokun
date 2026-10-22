@@ -19,6 +19,7 @@ with a dedicated 2× path. See [supported inputs and usage](../../README.md).
 
 Every build produces v68/v69/v73/v75/v79/v81 skeletons. The helper detects the
 architecture and loads the exact match; unsupported architectures fail.
+The install path is tried first unless `ADSP_LIBRARY_PATH` is set and nonempty.
 Default installation with `/usr` prefix:
 
 - Skeletons: `/usr/lib/dsp/cdsp/qcom-va-driver/vpp_v<arch>_skel.so`
