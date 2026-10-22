@@ -58,7 +58,7 @@ def main():
         with (root / (name + '.log')).open('w') as log:
             setup = subprocess.run(['meson', 'setup', str(build), str(source),
                                     '--native-file', str(native), '-Dgpu_copy=' + mode,
-                                    '-Dfastcv=disabled', '-Dwerror=true'],
+                                    '-Dwerror=true'],
                                    env=env, stdout=log, stderr=subprocess.STDOUT)
             if mode == 'enabled' and missing:
                 assert setup.returncode != 0, name

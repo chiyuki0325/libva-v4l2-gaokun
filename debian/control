@@ -20,4 +20,3 @@ Description: VA-API backend for Qualcomm Iris stateful V4L2 devices
  including Radxa Dragon Q8B, and requires a compatible kernel and firmware.
  .
  Includes the MSM driver alias and GStreamer VA environment configuration.
- FastCV video processing is disabled in distribution builds.
