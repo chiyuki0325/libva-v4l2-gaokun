@@ -1,0 +1,7 @@
+[wrap-file]
+directory = hexagon-open-access-19.0.02
+source_url = https://softwarecenter.qualcomm.com/api/download/software/tools/Hexagon_open_access/Linux/ARM64/Debian/19.0.02/Hexagon_open_access.Core.19.0.02.Linux-ARM64.tar.gz
+source_filename = Hexagon_open_access.Core.19.0.02.Linux-ARM64.tar.gz
+source_hash = 82f49d8e7e79402eb6fd71f2021e8714f15fc6564234de973daf0e4a962ce9ed
+lead_directory_missing = true
+patch_directory = hexagon

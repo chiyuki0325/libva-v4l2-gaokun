@@ -1,0 +1,6 @@
+[wrap-file]
+directory = fastrpc-a56e9d4de3614a8d8f4b0e15ff561350c4b686e3
+source_url = https://codeload.github.com/qualcomm/fastrpc/tar.gz/a56e9d4de3614a8d8f4b0e15ff561350c4b686e3
+source_filename = fastrpc-a56e9d4d.tar.gz
+source_hash = 9cae90624cd22ed6c013007f1eaaca0555903ebf91f2b3f16797985e09392c86
+patch_directory = fastrpc
