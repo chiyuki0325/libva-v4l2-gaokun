@@ -369,7 +369,7 @@ API(
                          VA_SURFACE_ATTRIB_MEM_TYPE_VA | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME |
                              VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2};
     if (config.entrypoint == VAEntrypointVideoProc) {
-        values[1] = 16;
+        values[1] = 2;
         values[2] = 2;
     } if (config.entrypoint == VAEntrypointEncSlice) {
         values[3] = 3840;
@@ -767,7 +767,7 @@ API(
                   !target->derived_images && !target->acquired_handles,
               "VPP surface is in use", VA_STATUS_ERROR_SURFACE_BUSY);
         try {
-            c->vpp->scale(picture, target);
+            c->vpp->process(picture, target);
         } catch (const Error &e) {
             target->status = e.status;
             throw;

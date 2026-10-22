@@ -20,7 +20,7 @@ struct CdspApi {
     decltype(&cdsp_vpp_destroy) destroy = nullptr;
     decltype(&cdsp_vpp_import) import = nullptr;
     decltype(&cdsp_vpp_release) release = nullptr;
-    decltype(&cdsp_vpp_process) process = nullptr;
+    decltype(&cdsp_vpp_transform) transform = nullptr;
     ~CdspApi() {
         if (library)
             dlclose(library);
@@ -48,7 +48,7 @@ std::shared_ptr<CdspApi> load_cdsp_api() {
     LOAD(destroy)
     LOAD(import)
     LOAD(release)
-    LOAD(process)
+    LOAD(transform)
 #undef LOAD
     cached = api;
     return api;
@@ -77,7 +77,9 @@ void vpp_caps(VAProcPipelineCaps &caps) {
         sizeof(colors) / sizeof(colors[0]);
     caps.input_pixel_format = caps.output_pixel_format = formats;
     caps.num_input_pixel_formats = caps.num_output_pixel_formats = 2;
-    caps.min_input_width = caps.min_output_width = 16;
+    caps.min_input_width = caps.min_output_width = 2;
+    caps.rotation_flags = (1 << VA_ROTATION_NONE) | (1 << VA_ROTATION_90) | (1 << VA_ROTATION_180) |
+                          (1 << VA_ROTATION_270);
     caps.min_input_height = caps.min_output_height = 2;
     caps.max_input_width = caps.max_output_width = 8192;
     caps.max_input_height = caps.max_output_height = 8192;
@@ -87,12 +89,13 @@ VppPicture vpp_picture(const Buffer &buffer, const std::shared_ptr<Surface> &sou
     VAProcPipelineParameterBuffer p{};
     std::memcpy(&p, buffer.data.data(), sizeof(p));
     check(!p.num_filters && !p.num_forward_references && !p.num_backward_references &&
-              !p.rotation_state && !p.mirror_state && !p.blend_state && !p.num_additional_outputs &&
+              !p.mirror_state && !p.blend_state && !p.num_additional_outputs &&
               !(p.pipeline_flags & ~VA_PROC_PIPELINE_FAST) &&
               !(p.filter_flags & ~VA_FILTER_SCALING_MASK) && !p.input_surface_flag &&
               !p.output_surface_flag && !p.output_hdr_metadata,
-          "VPP supports progressive scaling and bit-depth conversion only",
-          VA_STATUS_ERROR_UNIMPLEMENTED);
+          "unsupported VPP processing operation", VA_STATUS_ERROR_UNIMPLEMENTED);
+    check(p.rotation_state <= VA_ROTATION_270, "invalid VPP rotation",
+          VA_STATUS_ERROR_INVALID_PARAMETER);
     const auto &in = p.input_color_properties;
     const auto &out = p.output_color_properties;
     auto matches = [](unsigned a, unsigned b) { return !a || !b || a == b; };
@@ -109,20 +112,22 @@ VppPicture vpp_picture(const Buffer &buffer, const std::shared_ptr<Surface> &sou
           "VPP output must cover the entire surface", VA_STATUS_ERROR_UNIMPLEMENTED);
     VppPicture picture;
     picture.source = source;
+    picture.rotation = p.rotation_state;
     picture.region = p.surface_region ? *p.surface_region
                                       : VARectangle{0, 0, static_cast<uint16_t>(source->width),
                                                     static_cast<uint16_t>(source->height)};
     auto r = picture.region;
-    check(r.x >= 0 && r.y >= 0 && r.width && r.height && !(r.x & 15) && !(r.y & 1) &&
-              !(r.width & 15) && !(r.height & 1) && !(target.width & 15) && !(target.height & 1) &&
+    check(r.x >= 0 && r.y >= 0 && r.width && r.height && !(r.x & 1) && !(r.y & 1) &&
+              !(r.width & 1) && !(r.height & 1) && !(target.width & 1) && !(target.height & 1) &&
               unsigned(r.x) + r.width <= source->width &&
               unsigned(r.y) + r.height <= source->height,
-          "VPP requires 16-pixel widths/aligned crop x and even heights/crop y",
-          VA_STATUS_ERROR_INVALID_PARAMETER);
-    bool down = target.width <= r.width && target.height <= r.height;
-    bool up = target.width >= r.width && target.height >= r.height;
-    check((down || up) && uint64_t(target.width) * 20 >= r.width &&
-              uint64_t(target.height) * 20 >= r.height,
+          "VPP requires even dimensions and crop coordinates", VA_STATUS_ERROR_INVALID_PARAMETER);
+    unsigned scaled_width = (picture.rotation & 1) ? target.height : target.width;
+    unsigned scaled_height = (picture.rotation & 1) ? target.width : target.height;
+    bool down = scaled_width <= r.width && scaled_height <= r.height;
+    bool up = scaled_width >= r.width && scaled_height >= r.height;
+    check((down || up) && uint64_t(scaled_width) * 20 >= r.width &&
+              uint64_t(scaled_height) * 20 >= r.height,
           "VPP cannot mix up/down scaling axes or downscale beyond 20:1",
           VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
     check(source.get() != &target &&
@@ -199,7 +204,7 @@ struct Vpp::Impl {
     }
 };
 Vpp::Vpp() : impl_(std::make_unique<Impl>()) {}
-void Vpp::scale(const VppPicture &picture, const std::shared_ptr<Surface> &target) {
+void Vpp::process(const VppPicture &picture, const std::shared_ptr<Surface> &target) {
     const auto &source = picture.source;
     check(source && source->memory, "VPP source has no storage", VA_STATUS_ERROR_INVALID_SURFACE);
     if (!target->memory)
@@ -217,23 +222,25 @@ void Vpp::scale(const VppPicture &picture, const std::shared_ptr<Surface> &targe
     auto region = picture.region;
     cdsp_vpp_crop crop{unsigned(region.x), unsigned(region.y), region.width, region.height};
     uint64_t dsp_us = 0;
-    int e = impl_->api->process(
+    int e = impl_->api->transform(
         impl_->context, &in, source->fourcc == VA_FOURCC_P010 ? CDSP_VPP_P010 : CDSP_VPP_NV12,
-        &crop, &out, target->fourcc == VA_FOURCC_P010 ? CDSP_VPP_P010 : CDSP_VPP_NV12, &dsp_us);
+        &crop, &out, target->fourcc == VA_FOURCC_P010 ? CDSP_VPP_P010 : CDSP_VPP_NV12,
+        picture.rotation, &dsp_us);
     if (e) {
-        trace("CDSP VPP scale failed: %d", e);
-        throw Error(VA_STATUS_ERROR_OPERATION_FAILED, "CDSP VPP scaling failed");
+        trace("CDSP VPP processing failed: %d", e);
+        throw Error(VA_STATUS_ERROR_OPERATION_FAILED, "CDSP VPP processing failed");
     }
     target->status = VA_STATUS_SUCCESS;
-    trace("VPP CDSP %ux%u -> %ux%u src-fd=%d dst-fd=%d DSP=%llu us", region.width, region.height,
-          target->width, target->height, src.fd, dst.fd, static_cast<unsigned long long>(dsp_us));
+    trace("VPP CDSP %ux%u -> %ux%u rotation=%u src-fd=%d dst-fd=%d DSP=%llu us", region.width,
+          region.height, target->width, target->height, picture.rotation * 90, src.fd, dst.fd,
+          static_cast<unsigned long long>(dsp_us));
 }
 #else
 struct Vpp::Impl {};
 Vpp::Vpp() {
     throw Error(VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT, "CDSP VPP was disabled at build time");
 }
-void Vpp::scale(const VppPicture &, const std::shared_ptr<Surface> &) {
+void Vpp::process(const VppPicture &, const std::shared_ptr<Surface> &) {
     throw Error(VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT, "CDSP VPP was disabled at build time");
 }
 #endif
