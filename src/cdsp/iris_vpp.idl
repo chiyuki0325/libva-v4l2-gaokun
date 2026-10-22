@@ -1,0 +1,11 @@
+#include "remote.idl"
+interface iris_vpp : remote_handle64 {
+  long power(rout long mask);
+  long configure(in long src_width, in long src_height, in long dst_width, in long dst_height);
+  long run(in sequence<uint8_t> src, inrout sequence<uint8_t> dst,
+           in long src_stride, in long dst_stride, in long src_y_offset, in long src_uv_offset,
+           in long dst_y_offset, in long dst_uv_offset, in long worker_count,
+           rout unsigned long long usec);
+  long info(rout unsigned long hz, rout long hvx_units);
+  long profile(in long enable, rout sequence<unsigned long long> counters);
+};

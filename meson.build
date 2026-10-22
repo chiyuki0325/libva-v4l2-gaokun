@@ -22,6 +22,27 @@ if have_gpu_copy
 endif
 summary('GPU surface copy', have_gpu_copy)
 
+vpp_args = []
+vpp_dependencies = []
+cdsp_option = get_option('cdsp_vpp')
+have_cdsp_vpp = false
+if not cdsp_option.disabled()
+  supported_build = build_machine.system() == 'linux' and build_machine.cpu_family() == 'aarch64'
+  if cdsp_option.enabled() and not supported_build
+    error('cdsp_vpp requires a Linux ARM64 build machine (Open Access 19.0.02)')
+  endif
+  if supported_build
+    have_cdsp_vpp = find_program('ghc', native: true, required: cdsp_option).found()
+  endif
+endif
+if have_cdsp_vpp
+  subdir('src/cdsp')
+  vpp_args = ['-DHAVE_CDSP_VPP', '-DIRIS_VPP_CLIENT_PATH="' +
+              (get_option('prefix') / get_option('libdir') / 'libva-v4l2/libiris_vpp.so') + '"']
+  vpp_dependencies = [meson.get_compiler('cpp').find_library('dl')]
+endif
+summary('CDSP VPP', have_cdsp_vpp)
+
 sources = files(
   'src/backend.cpp',
   'src/decoder.cpp',
@@ -39,7 +60,8 @@ driver_install_dir = get_option('libdir') / 'dri'
 shared_library(
   'v4l2_drv_video',
   sources + copy_source,
-  dependencies: [va, drm, threads] + copy_dependencies,
+  dependencies: [va, drm, threads] + copy_dependencies + vpp_dependencies,
+  cpp_args: vpp_args,
   name_prefix: '',
   install: true,
   install_dir: driver_install_dir,
@@ -58,7 +80,10 @@ install_data('LICENSE', install_dir: get_option('datadir') / 'licenses' / meson.
 
 formatter = find_program('clang-format', required: false)
 if formatter.found()
-  sources += files('src/cpu-copy.cpp', 'src/gpu-copy.cpp')
+  sources += files('src/cpu-copy.cpp', 'src/gpu-copy.cpp', 'src/cdsp/client.cpp',
+                   'src/cdsp/dsp.c', 'src/cdsp/filter.h', 'src/cdsp/client.h',
+                   'src/cdsp/qurt_abi.h', 'src/cdsp/qurt_abi_checks.h',
+                   'src/cdsp/skel.cpp', 'src/cdsp/skel.h', 'src/cdsp/vpp_limits.h')
   run_target('format', command: [formatter, '-i', '--style=file', sources, headers])
   run_target('format-check', command: [formatter, '--dry-run', '--Werror', '--style=file', sources, headers])
 endif
