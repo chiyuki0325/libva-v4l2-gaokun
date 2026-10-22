@@ -49,20 +49,29 @@ static void reset(uint32_t arch, int failures = 0, int error = 0) {
 
 int main() {
     const std::string suffix = "?iris_vpp_skel_handle_invoke&_modver=1.0&_dom=cdsp";
-    for (uint32_t arch : {68u, 69u, 73u, 75u, 79u, 81u}) {
-        uint32_t packed = ((arch / 10) << 4) | (arch % 10);
-        for (uint32_t raw : {arch, packed, 0x100u | packed}) {
-            for (int failures : {0, 1, 2}) {
-                reset(raw, failures);
-                remote_handle64 handle = 0;
-                int e = cdsp_vpp_open_skel(&handle);
-                check(e == (failures == 2 ? -ENOENT : 0));
-                check(handle == (failures == 2 ? 0 : 123));
-                check(queries == 1 && opened.size() == (failures ? 2u : 1u));
-                std::string filename = "vpp_v" + std::to_string(arch) + "_skel.so";
-                check(opened[0] == "file:///" + filename + suffix);
-                if (failures)
-                    check(opened[1] == "file:///" IRIS_VPP_DSP_DIR "/" + filename + suffix);
+    for (const char *search_path : {static_cast<const char *>(nullptr), "", "/tmp/vpp-test"}) {
+        if (search_path)
+            check(setenv("ADSP_LIBRARY_PATH", search_path, 1) == 0);
+        else
+            check(unsetenv("ADSP_LIBRARY_PATH") == 0);
+        for (uint32_t arch : {68u, 69u, 73u, 75u, 79u, 81u}) {
+            uint32_t packed = ((arch / 10) << 4) | (arch % 10);
+            for (uint32_t raw : {arch, packed, 0x100u | packed}) {
+                for (int failures : {0, 1, 2}) {
+                    reset(raw, failures);
+                    remote_handle64 handle = 0;
+                    int e = cdsp_vpp_open_skel(&handle);
+                    check(e == (failures == 2 ? -ENOENT : 0));
+                    check(handle == (failures == 2 ? 0 : 123));
+                    check(queries == 1 && opened.size() == (failures ? 2u : 1u));
+                    std::string filename = "vpp_v" + std::to_string(arch) + "_skel.so";
+                    std::string search_uri = "file:///" + filename + suffix;
+                    std::string install_uri = "file:///" IRIS_VPP_DSP_DIR "/" + filename + suffix;
+                    bool search_first = search_path && *search_path;
+                    check(opened[0] == (search_first ? search_uri : install_uri));
+                    if (failures)
+                        check(opened[1] == (search_first ? install_uri : search_uri));
+                }
             }
         }
     }

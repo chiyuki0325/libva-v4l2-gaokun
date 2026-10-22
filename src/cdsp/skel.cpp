@@ -4,6 +4,7 @@
 #include "vpp_limits.h"
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 
 int cdsp_vpp_select_workers(int *workers) {
     if (!workers || *workers < 0 || *workers > CDSP_VPP_MAX_WORKERS)
@@ -56,15 +57,21 @@ int cdsp_vpp_open_skel(remote_handle64 *handle) {
     }
     constexpr char suffix[] = "?iris_vpp_skel_handle_invoke&_modver=1.0&_dom=cdsp";
     char uri[sizeof(IRIS_VPP_DSP_DIR) + sizeof(suffix) + 64];
-    snprintf(uri, sizeof(uri), "file:///vpp_v%u_skel.so%s", arch, suffix);
-    e = iris_vpp_open(uri, handle);
     // FastRPC's file:/// prefix is followed by the module path; an absolute
-    // install path therefore starts with four slashes. Never change architecture
-    // on a load failure: the second attempt uses the same file in the install dir.
-    if (e) {
-        snprintf(uri, sizeof(uri), "file:///" IRIS_VPP_DSP_DIR "/vpp_v%u_skel.so%s", arch, suffix);
-        e = iris_vpp_open(uri, handle);
-    }
+    // install path therefore starts with four slashes. Prefer it unless the
+    // caller explicitly supplies a search path (e.g. for an uninstalled build).
+    const char *search_path = getenv("ADSP_LIBRARY_PATH");
+    bool search_first = search_path && *search_path;
+    auto open = [&](bool search) {
+        snprintf(uri, sizeof(uri),
+                 search ? "file:///vpp_v%u_skel.so%s"
+                        : "file:///" IRIS_VPP_DSP_DIR "/vpp_v%u_skel.so%s",
+                 arch, suffix);
+        return iris_vpp_open(uri, handle);
+    };
+    e = open(search_first);
+    if (e)
+        e = open(!search_first);
     if (e)
         fprintf(stderr, "CDSP VPP: cannot load vpp_v%u_skel.so: %d\n", arch, e);
     return e;
