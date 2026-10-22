@@ -79,15 +79,16 @@ static void sync(int fd, uint64_t flags) {
 struct Allocation {
     VADRMPRIMESurfaceDescriptor desc{};
     uint8_t *data;
-    Allocation(unsigned w, unsigned h) {
+    Allocation(unsigned w, unsigned h, unsigned format = VA_FOURCC_NV12) {
         auto &obj = desc.objects[0];
         auto &l = desc.layers[0];
-        desc.fourcc = l.drm_format = DRM_FORMAT_NV12;
+        desc.fourcc = format;
+        l.drm_format = format == VA_FOURCC_P010 ? DRM_FORMAT_P010 : DRM_FORMAT_NV12;
         desc.width = w;
         desc.height = h;
         desc.num_objects = desc.num_layers = 1;
         l.num_planes = 2;
-        l.pitch[0] = l.pitch[1] = (w + 127) & ~127u;
+        l.pitch[0] = l.pitch[1] = (w * (format == VA_FOURCC_P010 ? 2 : 1) + 127) & ~127u;
         l.offset[0] = 128; // Nonzero base offset and padded Y rows are intentional.
         l.offset[1] = 128 + l.pitch[0] * ((h + 31) & ~31u);
         obj.size = (l.offset[1] + l.pitch[1] * ((h + 1) / 2) + 4095) & ~4095u;
@@ -123,25 +124,35 @@ static VASurfaceID import(VADisplay display, VADRMPRIMESurfaceDescriptor &desc) 
     require(owned.objects[0].fd >= 0, "duplicate descriptor fd");
     attrs[1].value.value.p = &owned;
     VASurfaceID id;
-    va(vaCreateSurfaces(display, VA_RT_FORMAT_YUV420, desc.width, desc.height, &id, 1, attrs, 2));
+    va(vaCreateSurfaces(
+        display, desc.fourcc == VA_FOURCC_P010 ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420,
+        desc.width, desc.height, &id, 1, attrs, 2));
     close(owned.objects[0].fd); // Driver must own its own fd after import.
     return id;
 }
 struct Case {
     unsigned sw, sh, dw, dh;
     bool crop;
+    unsigned src_format = VA_FOURCC_NV12, dst_format = VA_FOURCC_NV12;
 };
 static void run_case(Case c) {
-    Allocation input(c.sw, c.sh), reference(c.dw, c.dh), destination(c.dw, c.dh);
+    Allocation input(c.sw, c.sh, c.src_format), reference(c.dw, c.dh, c.dst_format),
+        destination(c.dw, c.dh, c.dst_format);
+    bool wide = c.src_format == VA_FOURCC_P010 || c.dst_format == VA_FOURCC_P010;
     auto &sl = input.desc.layers[0];
     sync(input.desc.objects[0].fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
     std::memset(input.data, 0xa5, input.desc.objects[0].size);
     for (unsigned p = 0; p < 2; ++p)
         for (unsigned y = 0; y < (p ? c.sh / 2 : c.sh); ++y)
             for (unsigned x = 0; x < c.sw; ++x)
-                input.data[sl.offset[p] + y * sl.pitch[p] + x] =
-                    p ? (x & 1 ? 150 + (x / 2 + y) % 80 : 20 + (x / 2 + y) % 80)
-                      : 16 + (x / 8 + y / 4) % 220;
+                if (c.src_format == VA_FOURCC_P010)
+                    reinterpret_cast<uint16_t *>(input.data + sl.offset[p] + y * sl.pitch[p])[x] =
+                        ((x * 37 + y * 53 + (p ? 257 : 0)) & 1023) << 6;
+                else
+                    input.data[sl.offset[p] + y * sl.pitch[p] + x] =
+                        wide ? (x * 37 + y * 53 + p * 71) & 255
+                        : p  ? (x & 1 ? 150 + (x / 2 + y) % 80 : 20 + (x / 2 + y) % 80)
+                             : 16 + (x / 8 + y / 4) % 220;
     sync(input.desc.objects[0].fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
     VARectangle region{static_cast<int16_t>(c.crop ? 16 : 0), static_cast<int16_t>(c.crop ? 2 : 0),
                        static_cast<uint16_t>(c.crop ? 608 : c.sw),
@@ -152,17 +163,25 @@ static void run_case(Case c) {
     std::vector<int> row(region.width);
     for (unsigned p = 0; p < 2; ++p) {
         int channels = p ? 2 : 1;
-        const auto *src =
-            input.data + sl.offset[p] + (region.y / channels) * sl.pitch[p] + region.x;
+        const auto *src = input.data + sl.offset[p] + (region.y / channels) * sl.pitch[p] +
+                          region.x * (c.src_format == VA_FOURCC_P010 ? 2 : 1);
         auto *dst = reference.data + reference.desc.layers[0].offset[p];
         for (unsigned y = 0; y < c.dh / channels; ++y) {
             auto fy = make_filter(region.height / channels, c.dh / channels, y);
             for (unsigned x = 0; x < region.width; ++x) {
                 int sum = 0;
-                for (int k = 0; k < fy.tap_count; ++k)
-                    sum += src[fy.indices[k] * sl.pitch[p] + x] * fy.weights[k];
-                row[x] = enlarging ? (sum + (1 << (fy.shift - 7))) >> (fy.shift - 6)
-                                   : round_clip_u8(sum, fy.shift);
+                for (int k = 0; k < fy.tap_count; ++k) {
+                    const auto *line = src + fy.indices[k] * sl.pitch[p];
+                    int sample = c.src_format == VA_FOURCC_P010
+                                     ? reinterpret_cast<const uint16_t *>(line)[x] >> 6
+                                     : line[x] << (wide ? 2 : 0);
+                    sum += sample * fy.weights[k];
+                }
+                if (wide)
+                    row[x] = (sum + (1 << (fy.shift - 5))) >> (fy.shift - 4);
+                else
+                    row[x] = enlarging ? (sum + (1 << (fy.shift - 7))) >> (fy.shift - 6)
+                                       : round_clip_u8(sum, fy.shift);
             }
             for (unsigned x = 0; x < c.dw / channels; ++x) {
                 auto fx = make_filter(region.width / channels, c.dw / channels, x);
@@ -170,8 +189,13 @@ static void run_case(Case c) {
                     int sum = 0;
                     for (int k = 0; k < fx.tap_count; ++k)
                         sum += row[fx.indices[k] * channels + ch] * fx.weights[k];
-                    dst[y * reference.desc.layers[0].pitch[p] + x * channels + ch] =
-                        round_clip_u8(sum, fx.shift + (enlarging ? 6 : 0));
+                    auto *line = dst + y * reference.desc.layers[0].pitch[p];
+                    int shift = fx.shift + (wide ? 4 : enlarging ? 6 : 0);
+                    if (c.dst_format == VA_FOURCC_P010)
+                        reinterpret_cast<uint16_t *>(line)[x * channels + ch] =
+                            clamp_int((sum + (1 << (shift - 1))) >> shift, 0, 1023) << 6;
+                    else
+                        line[x * channels + ch] = round_clip_u8(sum, shift + (wide ? 2 : 0));
                 }
             }
         }
@@ -183,31 +207,52 @@ static void run_case(Case c) {
     VADisplay display = vaGetDisplayDRM(drm);
     int major, minor;
     va(vaInitialize(display, &major, &minor));
+    VAConfigAttrib rt{VAConfigAttribRTFormat, 0};
+    va(vaGetConfigAttributes(display, VAProfileNone, VAEntrypointVideoProc, &rt, 1));
+    require(rt.value == (VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10), "VPP render formats");
     VAConfigID config;
     VAContextID context;
-    va(vaCreateConfig(display, VAProfileNone, VAEntrypointVideoProc, nullptr, 0, &config));
+    rt.value = c.dst_format == VA_FOURCC_P010 ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420;
+    va(vaCreateConfig(display, VAProfileNone, VAEntrypointVideoProc, &rt, 1, &config));
+    unsigned attribute_count = 0;
+    va(vaQuerySurfaceAttributes(display, config, nullptr, &attribute_count));
+    std::vector<VASurfaceAttrib> attributes(attribute_count);
+    va(vaQuerySurfaceAttributes(display, config, attributes.data(), &attribute_count));
+    unsigned formats = 0;
+    for (const auto &a : attributes)
+        if (a.type == VASurfaceAttribPixelFormat)
+            formats |= a.value.value.i == VA_FOURCC_NV12   ? 1
+                       : a.value.value.i == VA_FOURCC_P010 ? 2
+                                                           : 0;
+    require(formats == 3, "VPP surface formats");
     va(vaCreateContext(display, config, 0, 0, 0, nullptr, 0, &context));
     unsigned n = 0;
     va(vaQueryVideoProcFilters(display, context, nullptr, &n));
     require(n == 0, "scaling has no filters");
     VAProcPipelineCaps caps{};
     va(vaQueryVideoProcPipelineCaps(display, context, nullptr, 0, &caps));
-    require(caps.num_input_pixel_formats == 1, "NV12 capability count");
-    require(caps.input_pixel_format && caps.input_pixel_format[0] == VA_FOURCC_NV12,
-            "NV12 capability value");
+    require(caps.num_input_pixel_formats == 2 && caps.num_output_pixel_formats == 2,
+            "NV12/P010 capability count");
+    require(caps.input_pixel_format && caps.input_pixel_format[0] == VA_FOURCC_NV12 &&
+                caps.input_pixel_format[1] == VA_FOURCC_P010 &&
+                caps.output_pixel_format[1] == VA_FOURCC_P010,
+            "NV12/P010 capability values");
     auto in = import(display, input.desc);
     // Test composed and separate-layer PRIME2 imports.
     auto separate = destination.desc;
     separate.num_layers = 2;
-    separate.layers[0].drm_format = DRM_FORMAT_R8;
+    separate.layers[0].drm_format = c.dst_format == VA_FOURCC_P010 ? DRM_FORMAT_R16 : DRM_FORMAT_R8;
     separate.layers[0].num_planes = 1;
-    separate.layers[1].drm_format = DRM_FORMAT_GR88;
+    separate.layers[1].drm_format =
+        c.dst_format == VA_FOURCC_P010 ? DRM_FORMAT_GR1616 : DRM_FORMAT_GR88;
     separate.layers[1].num_planes = 1;
     separate.layers[1].pitch[0] = destination.desc.layers[0].pitch[1];
     separate.layers[1].offset[0] = destination.desc.layers[0].offset[1];
     VASurfaceID outputs[3];
     outputs[0] = import(display, separate);
-    va(vaCreateSurfaces(display, VA_RT_FORMAT_YUV420, c.dw, c.dh, &outputs[1], 2, nullptr, 0));
+    va(vaCreateSurfaces(
+        display, c.dst_format == VA_FOURCC_P010 ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420,
+        c.dw, c.dh, &outputs[1], 2, nullptr, 0));
     int initial_maps = maps, initial_unmaps = unmaps;
     for (unsigned kind = 0; kind < 3; ++kind) {
         VADRMPRIMESurfaceDescriptor exported{};
@@ -253,18 +298,29 @@ static void run_case(Case c) {
         for (unsigned p = 0; p < 2; ++p)
             for (unsigned y = 0; y < (p ? c.dh / 2 : c.dh); ++y)
                 for (unsigned x = 0; x < c.dw; ++x) {
-                    int a =
-                        static_cast<uint8_t *>(mapped)[image.offsets[p] + y * image.pitches[p] + x];
-                    int b = reference.data[reference.desc.layers[0].offset[p] +
-                                           y * reference.desc.layers[0].pitch[p] + x];
+                    const auto *actual =
+                        static_cast<uint8_t *>(mapped) + image.offsets[p] + y * image.pitches[p];
+                    const auto *expected = reference.data + reference.desc.layers[0].offset[p] +
+                                           y * reference.desc.layers[0].pitch[p];
+                    int a = c.dst_format == VA_FOURCC_P010
+                                ? reinterpret_cast<const uint16_t *>(actual)[x] >> 6
+                                : actual[x];
+                    int b = c.dst_format == VA_FOURCC_P010
+                                ? reinterpret_cast<const uint16_t *>(expected)[x] >> 6
+                                : expected[x];
+                    if (c.dst_format == VA_FOURCC_P010)
+                        require(!(reinterpret_cast<const uint16_t *>(actual)[x] & 63),
+                                "P010 low bits zero");
                     maxdiff[p] = std::max(maxdiff[p], unsigned(std::abs(a - b)));
                 }
         sync(reference.desc.objects[0].fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
         va(vaUnmapBuffer(display, image.buf));
         va(vaDestroyImage(display, image.image_id));
-        std::printf("%ux%u -> %ux%u crop=%d output=%u RPC=%d maxdiff Y=%u UV=%u\n", c.sw, c.sh,
-                    c.dw, c.dh, c.crop, kind, direct_calls, maxdiff[0], maxdiff[1]);
-        require(maxdiff[0] <= 1 && maxdiff[1] <= 1,
+        std::printf("%s -> %s %ux%u -> %ux%u crop=%d output=%u RPC=%d maxdiff Y=%u UV=%u\n",
+                    c.src_format == VA_FOURCC_P010 ? "P010" : "NV12",
+                    c.dst_format == VA_FOURCC_P010 ? "P010" : "NV12", c.sw, c.sh, c.dw, c.dh,
+                    c.crop, kind, direct_calls, maxdiff[0], maxdiff[1]);
+        require(maxdiff[0] <= unsigned(wide ? 0 : 1) && maxdiff[1] <= unsigned(wide ? 0 : 1),
                 "DSP matches CPU reference within rounding tolerance");
         close(exported.objects[0].fd);
     }
@@ -413,16 +469,104 @@ static void check_buffer_lifetime() {
     puts("PASS: buffer lifetime, changing pixels, padding, duplicate imports and profiling");
 }
 
+static void check_conversion_boundaries() {
+    constexpr size_t size = 8192;
+    auto *source = import_test_buffer(size), *target = import_test_buffer(size);
+    cdsp_vpp_frame src{source, 288, 8, 600, 16, 16 + 600 * 8};
+    cdsp_vpp_frame dst{target, 272, 4, 584, 32, 32 + 584 * 6};
+    cdsp_vpp_crop crop{16, 2, 272, 4};
+    for (int workers : {0, CDSP_VPP_MAX_WORKERS}) {
+        cdsp_vpp_context *ctx = nullptr;
+        require(!cdsp_vpp_create(&ctx, workers, 1), "conversion context");
+        for (int sf : {CDSP_VPP_NV12, CDSP_VPP_P010})
+            for (int df : {CDSP_VPP_NV12, CDSP_VPP_P010}) {
+                std::vector<uint8_t> input(size, 0xa5), expected(size, 0xa5);
+                for (unsigned plane = 0; plane < 2; plane++) {
+                    unsigned channels = plane ? 2 : 1;
+                    for (unsigned y = 0; y < src.height / channels; y++)
+                        for (unsigned x = 0; x < src.width; x++) {
+                            unsigned value = (x + y * src.width + plane * 71) & (sf ? 1023 : 255);
+                            auto *row = input.data() + (plane ? src.uv_offset : src.y_offset) +
+                                        y * src.stride;
+                            if (sf)
+                                reinterpret_cast<uint16_t *>(row)[x] = value << 6;
+                            else
+                                row[x] = value;
+                        }
+                    for (unsigned y = 0; y < dst.height / channels; y++)
+                        for (unsigned x = 0; x < dst.width; x++) {
+                            const auto *row = input.data() +
+                                              (plane ? src.uv_offset : src.y_offset) +
+                                              (y + crop.y / channels) * src.stride;
+                            unsigned value =
+                                sf ? reinterpret_cast<const uint16_t *>(row)[x + crop.x] >> 6
+                                   : row[x + crop.x] * 4;
+                            auto *out = expected.data() + (plane ? dst.uv_offset : dst.y_offset) +
+                                        y * dst.stride;
+                            if (df)
+                                reinterpret_cast<uint16_t *>(out)[x] = value << 6;
+                            else
+                                out[x] = std::min((value + 2) / 4, 255u);
+                        }
+                }
+                sync(cdsp_vpp_buffer_fd(source), DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
+                memcpy(cdsp_vpp_buffer_map(source), input.data(), size);
+                sync(cdsp_vpp_buffer_fd(source), DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+                sync(cdsp_vpp_buffer_fd(target), DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
+                memset(cdsp_vpp_buffer_map(target), 0xa5, size);
+                sync(cdsp_vpp_buffer_fd(target), DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+                uint64_t us;
+                require(!cdsp_vpp_process(ctx, &src, sf, &crop, &dst, df, &us),
+                        "conversion and format switch");
+                sync(cdsp_vpp_buffer_fd(target), DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+                require(!memcmp(cdsp_vpp_buffer_map(target), expected.data(), size),
+                        "conversion values and all padding");
+                sync(cdsp_vpp_buffer_fd(target), DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+            }
+        uint64_t us;
+        require(cdsp_vpp_process(ctx, &src, 2, &crop, &dst, CDSP_VPP_NV12, &us) != 0,
+                "reject format");
+        auto bad = src;
+        bad.stride = src.width;
+        require(cdsp_vpp_process(ctx, &bad, CDSP_VPP_P010, &crop, &dst, CDSP_VPP_NV12, &us) != 0,
+                "reject short P010 stride");
+        bad = src;
+        bad.y_offset++;
+        require(cdsp_vpp_process(ctx, &bad, CDSP_VPP_P010, &crop, &dst, CDSP_VPP_NV12, &us) != 0,
+                "reject unaligned P010");
+        cdsp_vpp_destroy(ctx);
+    }
+    cdsp_vpp_release(target);
+    cdsp_vpp_release(source);
+    puts("PASS: conversion rounding, format switches, padding and invalid layouts (scalar/HVX)");
+}
+
 int main() {
-    const Case cases[] = {{1920, 1080, 3840, 2160, false},
-                          {1920, 1080, 1280, 720, false},
-                          {1280, 720, 1920, 1080, false},
-                          {3840, 2160, 1920, 1080, false},
-                          {640, 360, 1280, 720, false},
-                          {640, 360, 640, 360, false},
-                          {640, 384, 320, 180, true},
-                          {16, 2, 32, 4, false},
-                          {32, 4, 16, 2, false}};
+    std::vector<Case> cases = {{1920, 1080, 3840, 2160, false},
+                               {1920, 1080, 1280, 720, false},
+                               {1280, 720, 1920, 1080, false},
+                               {3840, 2160, 1920, 1080, false},
+                               {640, 360, 1280, 720, false},
+                               {640, 360, 640, 360, false},
+                               {640, 384, 320, 180, true},
+                               {16, 2, 32, 4, false},
+                               {32, 4, 16, 2, false}};
+    for (unsigned src : {VA_FOURCC_NV12, VA_FOURCC_P010})
+        for (unsigned dst : {VA_FOURCC_NV12, VA_FOURCC_P010}) {
+            if (src == VA_FOURCC_NV12 && dst == VA_FOURCC_NV12)
+                continue;
+            for (Case c : {Case{1920, 1080, 1920, 1080, false}, Case{1920, 1080, 3840, 2160, false},
+                           Case{3840, 2160, 1920, 1080, false}, Case{1920, 1080, 1280, 720, false},
+                           Case{64, 18, 128, 18, false}, Case{128, 36, 128, 18, false},
+                           Case{640, 384, 608, 360, true},
+                           Case{640, 384, 320, 180, true}, Case{80, 18, 160, 36, false},
+                           Case{80, 18, 112, 24, false}, Case{640, 400, 32, 20, false},
+                           Case{16, 2, 16, 2, false}, Case{32, 4, 16, 2, false}}) {
+                c.src_format = src;
+                c.dst_format = dst;
+                cases.push_back(c);
+            }
+        }
     // FastRPC owns threads and process-global state. Never fork a process
     // that has already initialized them: each case starts in a fresh child.
     for (auto c : cases) {
@@ -436,5 +580,6 @@ int main() {
         require(waitpid(child, &status, 0) == child && status == 0, "test case child");
     }
     check_buffer_lifetime();
+    check_conversion_boundaries();
     std::puts("PASS");
 }

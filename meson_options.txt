@@ -5,7 +5,7 @@ option(
   value: false,
   description: 'Decode-only HFI Gen1 with 32-buffer limits; 10-bit requires Gen1 P010 kernel support',
 )
-option('cdsp_vpp', type: 'feature', value: 'disabled', description: 'NV12 scaling on CDSP (downloads QAIC and Hexagon Open Access 19.0.02)')
+option('cdsp_vpp', type: 'feature', value: 'disabled', description: 'Hardware-accelerated video processing on CDSP')
 option('fastrpc', type: 'combo', choices: ['auto', 'system', 'bundled'], value: 'auto', description: 'FastRPC client for CDSP VPP')
 option('fastrpc_include_dir', type: 'string', value: '/usr/include/fastrpc', description: 'System FastRPC headers')
 option('cdsp_firmware_dir', type: 'string', value: 'lib/dsp/cdsp/qcom-va-driver', description: 'Install directory for the CDSP VPP skeleton')

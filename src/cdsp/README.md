@@ -1,7 +1,8 @@
 # CDSP VPP
 
-NV12 area downscaling and Catmull–Rom upscaling using 128-byte HVX vectors,
-with a dedicated 2× path. See [supported inputs and usage](../../README.md).
+NV12/P010 area downscaling, Catmull–Rom upscaling and bit-depth conversion
+using 128-byte HVX vectors, with dedicated 2× paths.
+See [supported inputs and usage](../../README.md).
 
 ## Build and runtime
 
@@ -32,6 +33,8 @@ For uninstalled builds, set `LD_LIBRARY_PATH` and `ADSP_LIBRARY_PATH` to
 ## Maintenance
 
 - `dsp.c` / `filter.h`: Q7 area and Q14 cubic filters, cached per context.
+  P010 operations retain signed Q4 intermediates; NV12 output rounds and
+  saturates after filtering. Conversion preserves color range and matrix.
   Active workers follow the HVX count (1–8); each context currently allocates
   eight DSP threads. Multiple contexts therefore share a finite thread budget.
   Contexts request maximum core/bus performance.

@@ -28,6 +28,13 @@ typedef struct CubicTile {
     int use_delta[4], src_base, dst_offset, output_bytes, tap_count, spans_two_vectors;
     struct CubicTile *shared_pattern;
 } __attribute__((aligned(128))) CubicTile;
+// P010 filtering uses signed 16-bit rows and 32-bit accumulators. A tile
+// gathers up to 64 components from at most two vectors of intermediate data.
+typedef struct {
+    uint8_t indices[FILTER_MAX_TAPS][128];
+    int16_t weights[FILTER_MAX_TAPS][64];
+    int src_base, dst_offset, components, tap_count, spans_two_vectors;
+} __attribute__((aligned(128))) WideTile;
 typedef struct ScalerState ScalerState;
 typedef struct {
     ScalerState *state;
@@ -46,7 +53,9 @@ struct ScalerState {
     int area_tile_count[2];
     CubicTile *cubic_tiles[2];
     int cubic_tile_count[2];
-    int16_t *cubic_rows;
+    int16_t *cubic_rows, *wide_rows;
+    WideTile *wide_tiles[2];
+    int wide_tile_count[2], src_format, dst_format;
     Worker workers[CDSP_VPP_MAX_WORKERS]; // Spare workers stay asleep.
     int created_workers, stop;
     const uint8_t *src;
@@ -125,10 +134,15 @@ static void clear_filters(ScalerState *state) {
         free(state->vertical_filters[plane_index]);
         free(state->area_tiles[plane_index]);
         free(state->cubic_tiles[plane_index]);
+        free(state->wide_tiles[plane_index]);
+        state->wide_tiles[plane_index] = 0;
+        state->wide_tile_count[plane_index] = 0;
         state->cubic_tiles[plane_index] = 0;
         state->area_tiles[plane_index] = 0;
         state->horizontal_filters[plane_index] = state->vertical_filters[plane_index] = 0;
     }
+    free(state->wide_rows);
+    state->wide_rows = 0;
     free(state->area_rows);
     free(state->cubic_rows);
     state->cubic_rows = 0;
@@ -392,6 +406,72 @@ int iris_vpp_configure(remote_handle64 h, int src_width, int src_height, int dst
     }
     return 0;
 }
+// Build this cache only when a P010 operation needs resampling. NV12-only
+// contexts retain their existing kernels and memory footprint.
+static int prepare_wide_filters(ScalerState *state) {
+    if (state->wide_rows)
+        return 0;
+    for (int plane = 0; plane < 2 && state->dst_width != 2 * state->src_width; plane++) {
+        int channels = plane ? 2 : 1;
+        int capacity = 0;
+        for (int x = 0; x < state->dst_width;) {
+            Filter *first = &state->horizontal_filters[plane][x / channels];
+            int base = first->indices[0] * channels;
+            int count = 0;
+            while (count + channels <= 64 && x + count < state->dst_width) {
+                Filter *filter = &state->horizontal_filters[plane][(x + count) / channels];
+                int last = (filter->indices[filter->tap_count - 1] + 1) * channels;
+                if (last - base > 128)
+                    break;
+                count += channels;
+            }
+            if (!count)
+                goto fail;
+            if (state->wide_tile_count[plane] == capacity) {
+                int next = capacity ? capacity * 2 : 16;
+                WideTile *tiles = memalign(128, next * sizeof(*tiles));
+                if (!tiles)
+                    goto fail;
+                if (capacity)
+                    memcpy(tiles, state->wide_tiles[plane], capacity * sizeof(*tiles));
+                free(state->wide_tiles[plane]);
+                state->wide_tiles[plane] = tiles;
+                capacity = next;
+            }
+            WideTile *tile = &state->wide_tiles[plane][state->wide_tile_count[plane]++];
+            memset(tile, 0, sizeof(*tile));
+            tile->src_base = base;
+            tile->dst_offset = x;
+            tile->components = count;
+            for (int i = 0; i < count; i++) {
+                Filter *filter = &state->horizontal_filters[plane][(x + i) / channels];
+                if (filter->tap_count > tile->tap_count)
+                    tile->tap_count = filter->tap_count;
+                for (int k = 0; k < filter->tap_count; k++) {
+                    int byte = 2 * (filter->indices[k] * channels + i % channels - base);
+                    tile->indices[k][2 * i] = byte;
+                    tile->indices[k][2 * i + 1] = byte + 1;
+                    tile->weights[k][i] = filter->weights[k];
+                    tile->spans_two_vectors |= byte >= 128;
+                }
+            }
+            x += count;
+        }
+    }
+    state->wide_rows =
+        memalign(128, CDSP_VPP_MAX_WORKERS * cubic_row_stride_bytes(state->src_width));
+    if (!state->wide_rows)
+        goto fail;
+    memset(state->wide_rows, 0, CDSP_VPP_MAX_WORKERS * cubic_row_stride_bytes(state->src_width));
+    return 0;
+fail:
+    for (int plane = 0; plane < 2; plane++) {
+        free(state->wide_tiles[plane]);
+        state->wide_tiles[plane] = 0;
+        state->wide_tile_count[plane] = 0;
+    }
+    return AEE_ENOMEMORY;
+}
 typedef HVX_Vector UnalignedVector __attribute__((aligned(1)));
 // vlut32 selects 32-byte banks. Its inputs are byte-shuffled by the caller;
 // delta routing is the faster path when all requested lanes are conflict-free.
@@ -539,8 +619,11 @@ static void cubic_vertical_2x(const uint8_t *src, int stride, int16_t *row, int 
 }
 static void cubic_horizontal_2x(ScalerState *state, int plane_index, uint8_t *dst, int16_t *row) {
     int channels = plane_index ? 2 : 1;
+    int p010 = state->dst_format == CDSP_VPP_P010;
+    int shift = p010 ? 11 : 13;
     // Extend both borders independently per channel, then evaluate the two Q7
-    // phases [-3, 29, 111, -9] and [-9, 111, 29, -3]. Q6 * Q7 needs a 13-bit shift.
+    // phases [-3, 29, 111, -9] and [-9, 111, 29, -3]. The row is 8-bit Q6
+    // (equivalently 10-bit Q4); round directly to the destination bit depth.
     for (int j = 0; j < 2 * channels; j++) {
         row[j - 2 * channels] = row[j % channels];
         row[state->src_width + j] = row[state->src_width - channels + j % channels];
@@ -561,18 +644,34 @@ static void cubic_horizontal_2x(ScalerState *state, int plane_index, uint8_t *ds
         odd = Q6_Ww_vmpyacc_WwVhRh(odd, center, 0x006f006f);
         odd = Q6_Ww_vmpyacc_WwVhRh(odd, right1, 0x001d001d);
         odd = Q6_Ww_vmpyacc_WwVhRh(odd, right2, (int)0xfffdfffdu);
-        HVX_Vector even_samples = Q6_Vh_vasr_VwVwR_rnd_sat(Q6_V_hi_W(even), Q6_V_lo_W(even), 13);
-        HVX_Vector odd_samples = Q6_Vh_vasr_VwVwR_rnd_sat(Q6_V_hi_W(odd), Q6_V_lo_W(odd), 13);
+        HVX_Vector even_samples = Q6_Vh_vasr_VwVwR_rnd_sat(Q6_V_hi_W(even), Q6_V_lo_W(even), shift);
+        HVX_Vector odd_samples = Q6_Vh_vasr_VwVwR_rnd_sat(Q6_V_hi_W(odd), Q6_V_lo_W(odd), shift);
         HVX_VectorPair interleaved =
             Q6_W_vshuff_VVR(odd_samples, even_samples, plane_index ? -4 : -2);
-        HVX_Vector out = Q6_Vub_vpack_VhVh_sat(Q6_V_hi_W(interleaved), Q6_V_lo_W(interleaved));
-        int output_bytes = 2 * (state->src_width - x);
-        if (output_bytes >= 128)
-            *(UnalignedVector *)(dst + 2 * x) = out;
-        else {
-            uint8_t tail[128] __attribute__((aligned(128)));
-            *(HVX_Vector *)tail = out;
-            memcpy(dst + 2 * x, tail, output_bytes);
+        int components = 2 * (state->src_width - x);
+        if (p010) {
+            HVX_Vector lo = Q6_Vh_vmax_VhVh(Q6_V_lo_W(interleaved), Q6_V_vzero());
+            HVX_Vector hi = Q6_Vh_vmax_VhVh(Q6_V_hi_W(interleaved), Q6_V_vzero());
+            lo = Q6_Vh_vasl_VhR(Q6_Vh_vmin_VhVh(lo, Q6_V_vsplat_R(0x03ff03ff)), 6);
+            hi = Q6_Vh_vasl_VhR(Q6_Vh_vmin_VhVh(hi, Q6_V_vsplat_R(0x03ff03ff)), 6);
+            if (components >= 128) {
+                *(UnalignedVector *)(dst + 4 * x) = lo;
+                *(UnalignedVector *)(dst + 4 * x + 128) = hi;
+            } else {
+                uint8_t tail[256] __attribute__((aligned(128)));
+                *(HVX_Vector *)tail = lo;
+                *(HVX_Vector *)(tail + 128) = hi;
+                memcpy(dst + 4 * x, tail, 2 * components);
+            }
+        } else {
+            HVX_Vector out = Q6_Vub_vpack_VhVh_sat(Q6_V_hi_W(interleaved), Q6_V_lo_W(interleaved));
+            if (components >= 128)
+                *(UnalignedVector *)(dst + 2 * x) = out;
+            else {
+                uint8_t tail[128] __attribute__((aligned(128)));
+                *(HVX_Vector *)tail = out;
+                memcpy(dst + 2 * x, tail, components);
+            }
         }
     }
 }
@@ -762,6 +861,237 @@ static void scale_plane(ScalerState *state, const uint8_t *src, uint8_t *dst, in
             }
     }
 }
+// P010 stores ten significant bits in the high bits of little-endian words.
+// Preserve code values/range: 8->10 is a two-bit shift, 10->8 rounds and clips.
+static void convert_row(const uint8_t *src, uint8_t *dst, int width, int src_format, int dst_format,
+                        int hvx) {
+    if (src_format == dst_format) {
+        int bytes = width * (src_format == CDSP_VPP_P010 ? 2 : 1), x = 0;
+        if (hvx)
+            for (; x + 128 <= bytes; x += 128)
+                *(UnalignedVector *)(dst + x) = *(const UnalignedVector *)(src + x);
+        memcpy(dst + x, src + x, bytes - x);
+        return;
+    }
+    int x = 0;
+    if (hvx)
+        for (; x + 128 <= width; x += 128) {
+            if (src_format == CDSP_VPP_NV12) {
+                HVX_VectorPair words = Q6_Wuh_vunpack_Vub(*(const UnalignedVector *)(src + x));
+                *(UnalignedVector *)(dst + 2 * x) = Q6_Vh_vasl_VhR(Q6_V_lo_W(words), 8);
+                *(UnalignedVector *)(dst + 2 * x + 128) = Q6_Vh_vasl_VhR(Q6_V_hi_W(words), 8);
+            } else {
+                HVX_Vector lo = *(const UnalignedVector *)(src + 2 * x);
+                HVX_Vector hi = *(const UnalignedVector *)(src + 2 * x + 128);
+                // Saturating addition preserves the 1022/1023 -> 255 endpoint.
+                HVX_Vector bias = Q6_V_vsplat_R(0x00800080);
+                lo = Q6_Vuh_vadd_VuhVuh_sat(lo, bias);
+                hi = Q6_Vuh_vadd_VuhVuh_sat(hi, bias);
+                *(UnalignedVector *)(dst + x) = Q6_Vb_vpacko_VhVh(hi, lo);
+            }
+        }
+    for (; x < width; x++) {
+        if (src_format == CDSP_VPP_NV12)
+            ((uint16_t *)dst)[x] = (uint16_t)src[x] << 8;
+        else
+            dst[x] = clamp_int((((const uint16_t *)src)[x] + 128) >> 8, 0, 255);
+    }
+}
+static void wide_vertical(const uint8_t *src, int stride, int16_t *row, int width,
+                          const Filter *filter, int format, int hvx) {
+    // Q4 keeps 10-bit cubic overshoot within int16_t. Area uses the same
+    // precision so conversion to 8 bits happens only after both filter passes.
+    int shift = filter->shift - 4, x = 0;
+    if (hvx)
+        for (; x + 64 <= width; x += 64) {
+            HVX_VectorPair sum = Q6_W_vcombine_VV(Q6_V_vzero(), Q6_V_vzero());
+            for (int k = 0; k < filter->tap_count; k++) {
+                const uint8_t *line = src + filter->indices[k] * stride;
+                HVX_Vector samples;
+                if (format == CDSP_VPP_P010)
+                    samples = Q6_Vuh_vlsr_VuhR(*(const UnalignedVector *)(line + 2 * x), 6);
+                else {
+                    HVX_Vector bytes;
+                    if (x + 128 <= width)
+                        bytes = *(const UnalignedVector *)(line + x);
+                    else {
+                        uint8_t tail[128] __attribute__((aligned(128))) = {0};
+                        memcpy(tail, line + x, 64);
+                        bytes = *(HVX_Vector *)tail;
+                    }
+                    samples = Q6_Vh_vasl_VhR(Q6_V_lo_W(Q6_Wuh_vunpack_Vub(bytes)), 2);
+                }
+                uint32_t weight = (uint16_t)filter->weights[k] * 0x00010001u;
+                sum = Q6_Ww_vmpyacc_WwVhRh(sum, samples, weight);
+            }
+            *(HVX_Vector *)(row + x) =
+                Q6_Vh_vasr_VwVwR_rnd_sat(Q6_V_hi_W(sum), Q6_V_lo_W(sum), shift);
+        }
+    for (; x < width; x++) {
+        int sum = 0;
+        for (int k = 0; k < filter->tap_count; k++) {
+            const uint8_t *line = src + filter->indices[k] * stride;
+            int sample = format == CDSP_VPP_P010 ? ((const uint16_t *)line)[x] >> 6 : line[x] << 2;
+            sum += sample * filter->weights[k];
+        }
+        row[x] = (sum + (1 << (shift - 1))) >> shift;
+    }
+}
+static void wide_horizontal(ScalerState *state, int plane, uint8_t *dst, const int16_t *row,
+                            int hvx) {
+    int shift = state->horizontal_filters[plane][0].shift;
+    int extra = 4 + (state->dst_format == CDSP_VPP_NV12 ? 2 : 0);
+    if (hvx) {
+        for (int t = 0; t < state->wide_tile_count[plane]; t++) {
+            WideTile *tile = &state->wide_tiles[plane][t];
+            HVX_Vector lo = Q6_Vb_vshuff_Vb(*(const UnalignedVector *)(row + tile->src_base));
+            HVX_Vector hi = Q6_V_vzero();
+            if (tile->spans_two_vectors)
+                hi = Q6_Vb_vshuff_Vb(*(const UnalignedVector *)(row + tile->src_base + 64));
+            HVX_VectorPair sum = Q6_W_vcombine_VV(Q6_V_vzero(), Q6_V_vzero());
+            for (int k = 0; k < tile->tap_count; k++) {
+                HVX_Vector samples =
+                    gather_bytes(*(HVX_Vector *)tile->indices[k], lo, hi, tile->spans_two_vectors);
+                sum = Q6_Ww_vmpyacc_WwVhVh(sum, samples, *(HVX_Vector *)tile->weights[k]);
+            }
+            // The narrowing shift is four bits wide; discard fractional bits
+            // separately without rounding, then round exactly once at output.
+            HVX_Vector values =
+                Q6_Vh_vasr_VwVwR_rnd_sat(Q6_Vw_vasr_VwR(Q6_V_hi_W(sum), extra),
+                                         Q6_Vw_vasr_VwR(Q6_V_lo_W(sum), extra), shift);
+            int bytes = tile->components;
+            HVX_Vector out;
+            if (state->dst_format == CDSP_VPP_P010) {
+                values = Q6_Vh_vmax_VhVh(values, Q6_V_vzero());
+                values = Q6_Vh_vmin_VhVh(values, Q6_V_vsplat_R(0x03ff03ff));
+                out = Q6_Vh_vasl_VhR(values, 6);
+                bytes *= 2;
+            } else
+                out = Q6_Vub_vpack_VhVh_sat(Q6_V_vzero(), values);
+            uint8_t *target = dst + tile->dst_offset * (state->dst_format == CDSP_VPP_P010 ? 2 : 1);
+            if (bytes == 128)
+                *(UnalignedVector *)target = out;
+            else {
+                uint8_t tail[128] __attribute__((aligned(128)));
+                *(HVX_Vector *)tail = out;
+                memcpy(target, tail, bytes);
+            }
+        }
+        return;
+    }
+    int channels = plane ? 2 : 1;
+    for (int x = 0; x < state->dst_width; x++) {
+        Filter *filter = &state->horizontal_filters[plane][x / channels];
+        int sum = 0;
+        for (int k = 0; k < filter->tap_count; k++)
+            sum += row[filter->indices[k] * channels + x % channels] * filter->weights[k];
+        int value = (sum + (1 << (shift + extra - 1))) >> (shift + extra);
+        if (state->dst_format == CDSP_VPP_P010)
+            ((uint16_t *)dst)[x] = clamp_int(value, 0, 1023) << 6;
+        else
+            dst[x] = clamp_int(value, 0, 255);
+    }
+}
+static HVX_VectorPair load_10bit_samples(const uint8_t *src, int format) {
+    HVX_Vector lo, hi;
+    if (format == CDSP_VPP_P010) {
+        lo = Q6_Vuh_vlsr_VuhR(*(const UnalignedVector *)src, 6);
+        hi = Q6_Vuh_vlsr_VuhR(*(const UnalignedVector *)(src + 128), 6);
+    } else {
+        HVX_VectorPair words = Q6_Wuh_vunpack_Vub(*(const UnalignedVector *)src);
+        lo = Q6_Vh_vasl_VhR(Q6_V_lo_W(words), 2);
+        hi = Q6_Vh_vasl_VhR(Q6_V_hi_W(words), 2);
+    }
+    return Q6_W_vcombine_VV(hi, lo);
+}
+static void wide_downscale_2x_row(ScalerState *state, const uint8_t *r0, const uint8_t *r1,
+                                  uint8_t *dst, int channels, int hvx) {
+    int x = 0, src_bytes = state->src_format == CDSP_VPP_P010 ? 2 : 1;
+    if (hvx)
+        for (; x + 64 <= state->dst_width; x += 64) {
+            HVX_VectorPair a = load_10bit_samples(r0 + 2 * x * src_bytes, state->src_format);
+            HVX_VectorPair b = load_10bit_samples(r1 + 2 * x * src_bytes, state->src_format);
+            HVX_Vector lo = Q6_Vh_vadd_VhVh(Q6_V_lo_W(a), Q6_V_lo_W(b));
+            HVX_Vector hi = Q6_Vh_vadd_VhVh(Q6_V_hi_W(a), Q6_V_hi_W(b));
+            // Deinterleave whole U/V pairs for chroma, individual words for Y.
+            HVX_VectorPair pairs = Q6_W_vdeal_VVR(hi, lo, channels == 2 ? -4 : -2);
+            HVX_Vector sum = Q6_Vh_vadd_VhVh(Q6_V_lo_W(pairs), Q6_V_hi_W(pairs));
+            if (state->dst_format == CDSP_VPP_P010) {
+                sum = Q6_Vuh_vlsr_VuhR(Q6_Vh_vadd_VhVh(sum, Q6_V_vsplat_R(0x00020002)), 2);
+                *(UnalignedVector *)(dst + 2 * x) = Q6_Vh_vasl_VhR(sum, 6);
+            } else {
+                sum = Q6_Vuh_vlsr_VuhR(Q6_Vh_vadd_VhVh(sum, Q6_V_vsplat_R(0x00080008)), 4);
+                uint8_t out[128] __attribute__((aligned(128)));
+                *(HVX_Vector *)out = Q6_Vub_vpack_VhVh_sat(Q6_V_vzero(), sum);
+                memcpy(dst + x, out, 64);
+            }
+        }
+    for (; x < state->dst_width; x++) {
+        int index = 2 * (x / channels) * channels + x % channels;
+        int sum;
+        if (state->src_format == CDSP_VPP_P010) {
+            const uint16_t *a = (const uint16_t *)r0, *b = (const uint16_t *)r1;
+            sum = (a[index] >> 6) + (a[index + channels] >> 6) + (b[index] >> 6) +
+                  (b[index + channels] >> 6);
+        } else
+            sum = (r0[index] + r0[index + channels] + r1[index] + r1[index + channels]) * 4;
+        if (state->dst_format == CDSP_VPP_P010)
+            ((uint16_t *)dst)[x] = ((sum + 2) >> 2) << 6;
+        else
+            dst[x] = clamp_int((sum + 8) >> 4, 0, 255);
+    }
+}
+static void process_plane(ScalerState *state, const uint8_t *src, uint8_t *dst, int src_stride,
+                          int dst_stride, int plane, int hvx, int worker, int workers) {
+    if (state->src_format == CDSP_VPP_NV12 && state->dst_format == CDSP_VPP_NV12) {
+        scale_plane(state, src, dst, src_stride, dst_stride, plane, hvx, worker, workers);
+        return;
+    }
+    int height = state->dst_height / (plane ? 2 : 1);
+    int same_size = state->src_width == state->dst_width && state->src_height == state->dst_height;
+    int halve =
+        state->src_width == 2 * state->dst_width && state->src_height == 2 * state->dst_height;
+    int16_t *row = (same_size || halve)
+                       ? 0
+                       : (int16_t *)((uint8_t *)state->wide_rows +
+                                     worker * cubic_row_stride_bytes(state->src_width) + 128);
+    for (int y = height * worker / workers; y < height * (worker + 1) / workers; y++) {
+        if (same_size) {
+            convert_row(src + y * src_stride, dst + y * dst_stride, state->dst_width,
+                        state->src_format, state->dst_format, hvx);
+            continue;
+        }
+        if (hvx && src_stride <= 65535) {
+            int ahead = y + 2 < height ? y + 2 : y;
+            Filter *filter = &state->vertical_filters[plane][ahead];
+            int bytes = state->src_width * (state->src_format == CDSP_VPP_P010 ? 2 : 1);
+            Q6_l2fetch_AP((void *)(src + filter->indices[0] * src_stride),
+                          ((uint64_t)src_stride << 32) | ((uint64_t)bytes << 16) |
+                              (filter->indices[filter->tap_count - 1] - filter->indices[0] + 1));
+        }
+        if (halve) {
+            wide_downscale_2x_row(state, src + 2 * y * src_stride, src + (2 * y + 1) * src_stride,
+                                  dst + y * dst_stride, plane ? 2 : 1, hvx);
+            continue;
+        }
+        uint64_t start = state->profiling ? HAP_perf_get_time_us() : 0;
+        if (hvx && state->src_format == CDSP_VPP_NV12 && state->dst_height == 2 * state->src_height)
+            cubic_vertical_2x(src, src_stride, row, state->src_width,
+                              &state->vertical_filters[plane][y]);
+        else
+            wide_vertical(src, src_stride, row, state->src_width,
+                          &state->vertical_filters[plane][y], state->src_format, hvx);
+        uint64_t middle = state->profiling ? HAP_perf_get_time_us() : 0;
+        if (hvx && state->dst_width == 2 * state->src_width)
+            cubic_horizontal_2x(state, plane, dst + y * dst_stride, row);
+        else
+            wide_horizontal(state, plane, dst + y * dst_stride, row, hvx);
+        if (state->profiling) {
+            state->profile_us[worker * 4 + plane * 2] += middle - start;
+            state->profile_us[worker * 4 + plane * 2 + 1] += HAP_perf_get_time_us() - middle;
+        }
+    }
+}
 static void worker_main(void *opaque) {
     Worker *worker = opaque;
     ScalerState *state = worker->state;
@@ -771,12 +1101,12 @@ static void worker_main(void *opaque) {
             break;
         worker->status = qurt_hvx_lock(QURT_HVX_MODE_128B);
         if (!worker->status) {
-            scale_plane(state, state->src + state->src_y_offset, state->dst + state->dst_y_offset,
-                        state->src_stride, state->dst_stride, 0, 1, worker->worker_id,
-                        state->worker_count);
-            scale_plane(state, state->src + state->src_uv_offset, state->dst + state->dst_uv_offset,
-                        state->src_stride, state->dst_stride, 1, 1, worker->worker_id,
-                        state->worker_count);
+            process_plane(state, state->src + state->src_y_offset, state->dst + state->dst_y_offset,
+                          state->src_stride, state->dst_stride, 0, 1, worker->worker_id,
+                          state->worker_count);
+            process_plane(state, state->src + state->src_uv_offset,
+                          state->dst + state->dst_uv_offset, state->src_stride, state->dst_stride,
+                          1, 1, worker->worker_id, state->worker_count);
             // Publish HVX stores before the RPC thread observes completion.
             qurt_mem_syncht();
             qurt_hvx_unlock();
@@ -792,18 +1122,43 @@ static int plane_fits_buffer(int buffer_size, int offset, int stride, int width,
 int iris_vpp_run(remote_handle64 h, const uint8_t *src, int src_size, uint8_t *dst, int dst_size,
                  int src_stride, int dst_stride, int src_y_offset, int src_uv_offset,
                  int dst_y_offset, int dst_uv_offset, int worker_count, uint64_t *us) {
+    return iris_vpp_process(h, src, src_size, dst, dst_size, src_stride, dst_stride, src_y_offset,
+                            src_uv_offset, dst_y_offset, dst_uv_offset, worker_count, CDSP_VPP_NV12,
+                            CDSP_VPP_NV12, us);
+}
+int iris_vpp_process(remote_handle64 h, const uint8_t *src, int src_size, uint8_t *dst,
+                     int dst_size, int src_stride, int dst_stride, int src_y_offset,
+                     int src_uv_offset, int dst_y_offset, int dst_uv_offset, int worker_count,
+                     int src_format, int dst_format, uint64_t *us) {
     ScalerState *state = (ScalerState *)(uintptr_t)h;
+    if ((src_format != CDSP_VPP_NV12 && src_format != CDSP_VPP_P010) ||
+        (dst_format != CDSP_VPP_NV12 && dst_format != CDSP_VPP_P010))
+        return AEE_EBADPARM;
+    int src_bytes = src_format == CDSP_VPP_P010 ? 2 : 1;
+    int dst_bytes = dst_format == CDSP_VPP_P010 ? 2 : 1;
+    if (((src_stride | src_y_offset | src_uv_offset) & (src_bytes - 1)) ||
+        ((dst_stride | dst_y_offset | dst_uv_offset) & (dst_bytes - 1)))
+        return AEE_EBADPARM;
     if (!state->src_width || !src || !dst || src_size < 0 || dst_size < 0 || worker_count < 0 ||
         worker_count > CDSP_VPP_MAX_WORKERS ||
-        !plane_fits_buffer(src_size, src_y_offset, src_stride, state->src_width,
+        !plane_fits_buffer(src_size, src_y_offset, src_stride, state->src_width * src_bytes,
                            state->src_height) ||
-        !plane_fits_buffer(src_size, src_uv_offset, src_stride, state->src_width,
+        !plane_fits_buffer(src_size, src_uv_offset, src_stride, state->src_width * src_bytes,
                            state->src_height / 2) ||
-        !plane_fits_buffer(dst_size, dst_y_offset, dst_stride, state->dst_width,
+        !plane_fits_buffer(dst_size, dst_y_offset, dst_stride, state->dst_width * dst_bytes,
                            state->dst_height) ||
-        !plane_fits_buffer(dst_size, dst_uv_offset, dst_stride, state->dst_width,
+        !plane_fits_buffer(dst_size, dst_uv_offset, dst_stride, state->dst_width * dst_bytes,
                            state->dst_height / 2))
         return AEE_EBADPARM;
+    state->src_format = src_format;
+    state->dst_format = dst_format;
+    if ((src_format == CDSP_VPP_P010 || dst_format == CDSP_VPP_P010) &&
+        (state->src_width != state->dst_width || state->src_height != state->dst_height) &&
+        !(state->src_width == 2 * state->dst_width && state->src_height == 2 * state->dst_height)) {
+        int e = prepare_wide_filters(state);
+        if (e)
+            return e;
+    }
     uint64_t start_us = HAP_perf_get_time_us();
     if (state->profiling)
         memset(state->profile_us, 0, sizeof(state->profile_us));
@@ -830,10 +1185,10 @@ int iris_vpp_run(remote_handle64 h, const uint8_t *src, int src_size, uint8_t *d
     }
     if (worker_count && qurt_hvx_lock(QURT_HVX_MODE_128B) != 0)
         return AEE_EFAILED;
-    scale_plane(state, src + src_y_offset, dst + dst_y_offset, src_stride, dst_stride, 0,
-                worker_count, 0, 1);
-    scale_plane(state, src + src_uv_offset, dst + dst_uv_offset, src_stride, dst_stride, 1,
-                worker_count, 0, 1);
+    process_plane(state, src + src_y_offset, dst + dst_y_offset, src_stride, dst_stride, 0,
+                  worker_count, 0, 1);
+    process_plane(state, src + src_uv_offset, dst + dst_uv_offset, src_stride, dst_stride, 1,
+                  worker_count, 0, 1);
     if (worker_count)
         qurt_hvx_unlock();
     *us = HAP_perf_get_time_us() - start_us;
