@@ -1,2 +1,1 @@
 option('gpu_copy', type: 'feature', value: 'auto', description: 'Surface copying with EGL, GLES 3.2, and GBM')
-option('fastcv', type: 'feature', value: 'disabled', description: 'VA-API scaling with FastCV on CDSP')

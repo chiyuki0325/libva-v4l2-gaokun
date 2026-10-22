@@ -8,8 +8,6 @@ arch=('aarch64')
 license=('MIT' 'GPL-2.0-only') # backend MIT; bundled Linux patch GPL-2.0-only
 depends=('glibc' 'gcc-libs' 'libva' 'libdrm' 'mesa' 'libglvnd')
 makedepends=('meson' 'ninja')
-optdepends=('qcom-fastcv-binaries: CDSP video scaling'
-            'qcom-fastrpc: CDSP video scaling')
 source=("$pkgname-$pkgver.tar.gz")
 # The archive is generated locally from the current working tree.
 sha256sums=('SKIP')

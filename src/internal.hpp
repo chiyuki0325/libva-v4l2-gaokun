@@ -46,7 +46,6 @@ template <class... A> void trace(const char *f, A... a) {
 }
 enum class MemoryOrigin { Unknown, MsmWriteCombined, MsmCoherent, DmaHeap, Imported, Iris };
 struct Memory {
-    std::shared_ptr<void> fastcv_registration;
     MemoryOrigin origin = MemoryOrigin::Unknown;
     int fd = -1;
     void *mapping = nullptr;
@@ -242,8 +241,6 @@ struct VppPicture {
     VARectangle region{};
 };
 class Vpp {
-    std::shared_ptr<void> runtime_;
-
   public:
     Vpp();
     void scale(const VppPicture &picture, const std::shared_ptr<Surface> &target);

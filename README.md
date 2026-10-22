@@ -17,9 +17,6 @@ providing hardware decoding and encoding on **SC8280XP**, tested on
 - Encoding: CQP/CBR/VBR, even dimensions from 128×128 to 3840×2160, I/P frames
   with one reference; no B frames. I-frame requests produce IDR frames.
   HEVC uses Main tier; Main10 encoding is unsupported.
-- Optional FastCV VPP scales linear NV12 on CDSP with DMA-BUF support;
-  widths must be multiples of 16 and heights even. No color/bit-depth
-  conversion or other VPP filters.
 - Compatible DMA-BUF paths avoid raw-frame copies; cached surfaces may need
   GPU or CPU copying. PRIME1/PRIME2 import accepts single-buffer linear
   NV12/P010; export uses PRIME2.
@@ -53,7 +50,6 @@ depends on content and pipeline.
   output, larger CAPTURE pools, encoder deblocking controls, and error timestamps.
 - C++17 compiler, Meson ≥ 0.61, Ninja, pkg-config, libva ≥ 1.10 and libdrm
   development libraries. GPU-copy also requires EGL, GLES 3.2, and GBM.
-- For VPP: FastCV and FastRPC libraries with a working CDSP runtime.
 
 ## Build and install
 
@@ -77,9 +73,6 @@ sudo meson install -C build
 - `-Dgpu_copy=auto` (default): enable GPU copying when dependencies are available;
   `disabled` uses CPU copying when needed, `enabled` requires dependencies.
   DMA-BUF zero-copy paths are unaffected. Distribution packages enable GPU-copy.
-- `-Dfastcv=disabled` (default): omit VPP; `auto` enables it when dependencies
-  are available, `enabled` requires them. Missing runtime libraries disable
-  only VPP. Debian/Ubuntu packages disable FastCV.
 
 Adjust `libdir` if drivers belong somewhere other than `/usr/lib/dri`.
 The installed MSM alias selects this backend automatically on the target platform.
@@ -113,8 +106,6 @@ ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \
   -c:v h264_vaapi -bf 0 -qp 24 -async_depth 4 output.mp4
 ```
 
-- With FastCV VPP enabled, add `-vf scale_vaapi=w=1920:h=1080` to the
-  transcoding command to scale decoded NV12 on CDSP.
 - MP4 and raw H.264 output are supported; for Matroska, encode to raw H.264
   first and remux. FFmpeg packed-header warnings are expected because firmware
   produces the headers. Custom VUI/SEI metadata is not forwarded.

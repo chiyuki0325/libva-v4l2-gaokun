@@ -6,7 +6,7 @@ export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 	dh $@ --buildsystem=meson
 
 override_dh_auto_configure:
-	dh_auto_configure -- -Dfastcv=disabled -Dgpu_copy=enabled
+	dh_auto_configure -- -Dgpu_copy=enabled
 
 override_dh_auto_install:
 	dh_auto_install
