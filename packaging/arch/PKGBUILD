@@ -6,17 +6,26 @@ pkgrel=1
 pkgdesc='VA-API backend for Qualcomm Iris stateful V4L2 M2M decoding and H.264/HEVC encoding'
 arch=('aarch64')
 license=('MIT' 'GPL-2.0-only') # backend MIT; bundled Linux patch GPL-2.0-only
-depends=('glibc' 'gcc-libs' 'libva' 'libdrm' 'mesa' 'libglvnd')
-makedepends=('meson' 'ninja')
+depends=('glibc' 'gcc-libs' 'libva' 'libdrm' 'mesa' 'libglvnd' 'qcom-fastrpc')
+makedepends=('meson' 'ninja' 'ghc' 'haskell-syb')
+# Native strip cannot process the Hexagon DSP skeleton.
+options=('!strip')
 source=("$pkgname-$pkgver.tar.gz")
 # The archive is generated locally from the current working tree.
 sha256sums=('SKIP')
+
+prepare() {
+  # Fetch required build tools here so build() can run with nodownload.
+  # FastRPC is supplied by qcom-fastrpc, not the fallback subproject.
+  meson subprojects download --sourcedir="$srcdir/$pkgname-$pkgver" qaic hexagon
+}
 
 build() {
   # make-dist.py fixes source mtimes to zero. Reusing Ninja objects from an
   # earlier snapshot can silently package the old driver despite new sources.
   rm -rf "$srcdir/build"
-  arch-meson "$srcdir/$pkgname-$pkgver" "$srcdir/build" -Dgpu_copy=enabled
+  arch-meson "$srcdir/$pkgname-$pkgver" "$srcdir/build" \
+    -Dgpu_copy=enabled -Dcdsp_vpp=enabled -Dfastrpc=system
   meson compile -C "$srcdir/build"
 }
 

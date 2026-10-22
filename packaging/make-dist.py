@@ -32,6 +32,9 @@ def main():
     for directory in ('src', 'patches', 'tests'):
         paths += [p for p in (root / directory).rglob('*') if p.is_file()
                   and '__pycache__' not in p.parts and p.suffix != '.pyc']
+    paths += list((root / 'subprojects').glob('*.wrap'))
+    paths += [p for p in (root / 'subprojects/packagefiles').rglob('*') if p.is_file()
+              and '__pycache__' not in p.parts]
     archive(root / 'packaging/arch' / (name + '.tar.gz'), [(name + '/' + str(p.relative_to(root)), p) for p in paths])
 
 
