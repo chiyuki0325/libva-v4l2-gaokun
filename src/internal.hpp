@@ -53,6 +53,7 @@ struct Memory {
     unsigned index = 0, stride = 0, storage_height = 0, width = 0, height = 0;
     unsigned data_offset = 0, fourcc = VA_FOURCC_NV12;
     bool queued = false;
+    std::shared_ptr<void> vpp_registration;
     ~Memory();
     uint8_t *map();
 };
@@ -241,8 +242,12 @@ struct VppPicture {
     VARectangle region{};
 };
 class Vpp {
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+
   public:
     Vpp();
+    ~Vpp();
     void scale(const VppPicture &picture, const std::shared_ptr<Surface> &target);
 };
 VppPicture vpp_picture(const Buffer &buffer, const std::shared_ptr<Surface> &source,
