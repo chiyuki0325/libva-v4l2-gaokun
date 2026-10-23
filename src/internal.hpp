@@ -26,6 +26,9 @@
 extern "C" int irisva_msm_allocate(int drm_fd, uint64_t size, int *coherent);
 
 namespace irisva {
+inline bool is_rgb(unsigned fourcc) {
+    return fourcc == VA_FOURCC_BGRA || fourcc == VA_FOURCC_RGBA;
+}
 struct Error : std::runtime_error {
     VAStatus status;
     Error(VAStatus s, const std::string &m) : std::runtime_error(m), status(s) {}

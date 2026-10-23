@@ -153,8 +153,9 @@ static unsigned profile_format(VAProfile p) {
     return is_10bit(p) * VA_RT_FORMAT_YUV420_10 | !is_vp9_2 * VA_RT_FORMAT_YUV420;
 }
 static unsigned render_formats(VAProfile profile, VAEntrypoint entrypoint) {
-    return entrypoint == VAEntrypointVideoProc ? (VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10)
-                                               : profile_format(profile);
+    return entrypoint == VAEntrypointVideoProc
+               ? (VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10 | VA_RT_FORMAT_RGB32)
+               : profile_format(profile);
 }
 static unsigned profile_fourcc(VAProfile p) {
     return is_10bit(p) ? VA_FOURCC_P010 : VA_FOURCC_NV12;
@@ -203,12 +204,20 @@ static VAImageFormat image_format(unsigned fourcc) {
     f.fourcc = fourcc;
     f.byte_order = VA_LSB_FIRST;
     f.bits_per_pixel = fourcc == VA_FOURCC_P010 ? 24 : 12;
+    if (is_rgb(fourcc)) {
+        f.bits_per_pixel = f.depth = 32;
+        f.red_mask = fourcc == VA_FOURCC_BGRA ? 0xff0000 : 0xff;
+        f.green_mask = 0xff00;
+        f.blue_mask = fourcc == VA_FOURCC_BGRA ? 0xff : 0xff0000;
+        f.alpha_mask = 0xff000000;
+    }
     return f;
 }
 static VAImage create_image(Driver &d, unsigned fourcc, unsigned w, unsigned h) {
     check(w && h && w <= 8192 && h <= 8192, "invalid image dimensions",
           VA_STATUS_ERROR_INVALID_PARAMETER);
-    check(fourcc == VA_FOURCC_NV12 || fourcc == VA_FOURCC_I420 || fourcc == VA_FOURCC_P010,
+    check(fourcc == VA_FOURCC_NV12 || fourcc == VA_FOURCC_I420 || fourcc == VA_FOURCC_P010 ||
+              is_rgb(fourcc),
           "unsupported image format", VA_STATUS_ERROR_INVALID_IMAGE_FORMAT);
     VAImage image{};
     image.image_id = d.next_id++;
@@ -219,7 +228,12 @@ static VAImage create_image(Driver &d, unsigned fourcc, unsigned w, unsigned h) 
     image.pitches[0] = ((w + 1) & ~1u) * (fourcc == VA_FOURCC_P010 ? 2 : 1);
     image.offsets[1] = image.pitches[0] * h;
     unsigned chroma_h = (h + 1) / 2;
-    if (fourcc != VA_FOURCC_I420) {
+    if (is_rgb(fourcc)) {
+        image.num_planes = 1;
+        image.pitches[0] = w * 4;
+        image.offsets[1] = 0;
+        image.data_size = image.pitches[0] * h;
+    } else if (fourcc != VA_FOURCC_I420) {
         image.num_planes = 2;
         image.pitches[1] = image.pitches[0];
         image.data_size = image.offsets[1] + image.pitches[1] * chroma_h;
@@ -354,7 +368,7 @@ API(
     auto config = lookup(d.configs, id, VA_STATUS_ERROR_INVALID_CONFIG);
     auto profile = config.profile;
     check(count, "null surface attribute count", VA_STATUS_ERROR_INVALID_PARAMETER);
-    VASurfaceAttrib a[7]{};
+    VASurfaceAttrib a[9]{};
     VASurfaceAttribType types[] = {VASurfaceAttribPixelFormat, VASurfaceAttribMinWidth,
                                    VASurfaceAttribMinHeight, VASurfaceAttribMaxWidth,
                                    VASurfaceAttribMaxHeight, VASurfaceAttribMemoryType};
@@ -378,6 +392,10 @@ API(
     if (config.entrypoint == VAEntrypointVideoProc) {
         a[n] = a[0];
         a[n++].value.value.i = VA_FOURCC_P010;
+        a[n] = a[0];
+        a[n++].value.value.i = VA_FOURCC_BGRA;
+        a[n] = a[0];
+        a[n++].value.value.i = VA_FOURCC_RGBA;
     } else if (values[0] != VA_FOURCC_NV12 && (profile_format(profile) & VA_RT_FORMAT_YUV420)) {
         a[n] = a[0];
         a[n++].value.value.i = VA_FOURCC_NV12;
@@ -393,9 +411,10 @@ API(
 // PRIME1 has no explicit modifier, so only unflagged linear buffers are accepted.
 static VADRMPRIMESurfaceDescriptor
 prime_descriptor(const VASurfaceAttribExternalBuffers &external) {
+    bool rgb = is_rgb(external.pixel_format);
     check(external.num_buffers == 1 && external.buffers && external.buffers[0] <= INT_MAX &&
-              external.num_planes == 2 && !external.flags,
-          "PRIME1 requires one linear DMA-BUF with two planes", VA_STATUS_ERROR_INVALID_PARAMETER);
+              external.num_planes == (rgb ? 1u : 2u) && !external.flags,
+          "PRIME1 requires one linear DMA-BUF", VA_STATUS_ERROR_INVALID_PARAMETER);
     VADRMPRIMESurfaceDescriptor desc{};
     desc.fourcc = external.pixel_format;
     desc.width = external.width;
@@ -406,8 +425,11 @@ prime_descriptor(const VASurfaceAttribExternalBuffers &external) {
     desc.objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
     auto &layer = desc.layers[0];
     layer.drm_format = external.pixel_format == VA_FOURCC_P010 ? DRM_FORMAT_P010 : DRM_FORMAT_NV12;
-    layer.num_planes = 2;
-    for (unsigned i = 0; i < 2; ++i) {
+    if (rgb)
+        layer.drm_format =
+            external.pixel_format == VA_FOURCC_BGRA ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_ABGR8888;
+    layer.num_planes = rgb ? 1 : 2;
+    for (unsigned i = 0; i < layer.num_planes; ++i) {
         layer.offset[i] = external.offsets[i];
         layer.pitch[i] = external.pitches[i];
     }
@@ -418,11 +440,23 @@ static std::shared_ptr<Memory> import_prime(const VADRMPRIMESurfaceDescriptor &d
     check(desc.fourcc == fourcc && desc.width == width && desc.height == height &&
               desc.num_objects == 1 && desc.objects[0].fd >= 0 &&
               desc.objects[0].drm_format_modifier == DRM_FORMAT_MOD_LINEAR,
-          "import requires matching single-object linear NV12/P010",
+          "import requires matching single-object linear surface",
           VA_STATUS_ERROR_INVALID_PARAMETER);
     bool p010 = fourcc == VA_FOURCC_P010;
     unsigned offsets[2]{}, pitches[2]{};
-    if (desc.num_layers == 1) {
+    bool rgb = is_rgb(fourcc);
+    if (rgb) {
+        const auto &l = desc.layers[0];
+        check(desc.num_layers == 1 && l.num_planes == 1 && !l.object_index[0] &&
+                  l.drm_format ==
+                      (fourcc == VA_FOURCC_BGRA ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_ABGR8888) &&
+                  !(l.offset[0] & 3) && !(l.pitch[0] & 3) && l.pitch[0] >= width * 4 &&
+                  uint64_t(l.offset[0]) + uint64_t(height - 1) * l.pitch[0] + width * 4 <=
+                      desc.objects[0].size,
+              "invalid RGB DMA-BUF layout", VA_STATUS_ERROR_INVALID_PARAMETER);
+        offsets[0] = l.offset[0];
+        pitches[0] = l.pitch[0];
+    } else if (desc.num_layers == 1) {
         const auto &l = desc.layers[0];
         check(l.drm_format == (p010 ? DRM_FORMAT_P010 : DRM_FORMAT_NV12) && l.num_planes == 2 &&
                   !l.object_index[0] && !l.object_index[1],
@@ -446,12 +480,12 @@ static std::shared_ptr<Memory> import_prime(const VADRMPRIMESurfaceDescriptor &d
     }
     unsigned sample_bytes = p010 ? 2 : 1;
     unsigned row_bytes = ((width + 1) & ~1u) * sample_bytes;
-    check(pitches[0] >= row_bytes && pitches[0] == pitches[1] && pitches[0] % sample_bytes == 0 &&
-              offsets[0] % sample_bytes == 0 && offsets[1] >= offsets[0] &&
-              (offsets[1] - offsets[0]) % pitches[0] == 0 &&
-              (offsets[1] - offsets[0]) / pitches[0] >= height &&
-              uint64_t(offsets[1]) + uint64_t((height + 1) / 2 - 1) * pitches[1] + row_bytes <=
-                  desc.objects[0].size,
+    check(rgb || (pitches[0] >= row_bytes && pitches[0] == pitches[1] &&
+                  pitches[0] % sample_bytes == 0 && offsets[0] % sample_bytes == 0 &&
+                  offsets[1] >= offsets[0] && (offsets[1] - offsets[0]) % pitches[0] == 0 &&
+                  (offsets[1] - offsets[0]) / pitches[0] >= height &&
+                  uint64_t(offsets[1]) + uint64_t((height + 1) / 2 - 1) * pitches[1] + row_bytes <=
+                      desc.objects[0].size),
           "unsupported DMA-BUF plane layout", VA_STATUS_ERROR_INVALID_PARAMETER);
     auto m = std::make_shared<Memory>();
     m->fd = fcntl(desc.objects[0].fd, F_DUPFD_CLOEXEC, 0);
@@ -466,7 +500,7 @@ static std::shared_ptr<Memory> import_prime(const VADRMPRIMESurfaceDescriptor &d
     m->width = width;
     m->height = height;
     m->stride = pitches[0];
-    m->storage_height = (offsets[1] - offsets[0]) / pitches[0];
+    m->storage_height = rgb ? height : (offsets[1] - offsets[0]) / pitches[0];
     m->data_offset = offsets[0];
     m->origin = MemoryOrigin::Imported;
     return m;
@@ -475,11 +509,15 @@ API(
     create_surfaces,
     (VADriverContextP ctx, unsigned format, unsigned w, unsigned h, VASurfaceID *ids,
      unsigned count, VASurfaceAttrib *attrs, unsigned nattrs),
-    check(format == VA_RT_FORMAT_YUV420 || format == VA_RT_FORMAT_YUV420_10,
+    check(format == VA_RT_FORMAT_YUV420 || format == VA_RT_FORMAT_YUV420_10 ||
+              format == VA_RT_FORMAT_RGB32,
           "unsupported surface RT format", VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
     check(w && h && w <= 8192 && h <= 8192 && ids && count <= 256, "invalid surfaces",
           VA_STATUS_ERROR_INVALID_PARAMETER);
     check(!nattrs || attrs, "null surface attributes", VA_STATUS_ERROR_INVALID_PARAMETER);
+    unsigned fourcc = format == VA_RT_FORMAT_RGB32       ? VA_FOURCC_BGRA
+                      : format == VA_RT_FORMAT_YUV420_10 ? VA_FOURCC_P010
+                                                         : VA_FOURCC_NV12;
     unsigned memory_type = VA_SURFACE_ATTRIB_MEM_TYPE_VA; const void *external = nullptr;
     bool explicit_modifier = false; for (unsigned i = 0; i < nattrs; ++i) {
         if (!(attrs[i].flags & VA_SURFACE_ATTRIB_SETTABLE))
@@ -507,12 +545,13 @@ API(
         }
         check(attrs[i].value.type == VAGenericValueTypeInteger, "unsupported surface attribute",
               VA_STATUS_ERROR_ATTR_NOT_SUPPORTED);
-        if (attrs[i].type == VASurfaceAttribPixelFormat)
-            check(unsigned(attrs[i].value.value.i) ==
-                      (format == VA_RT_FORMAT_YUV420_10 ? VA_FOURCC_P010 : VA_FOURCC_NV12),
+        if (attrs[i].type == VASurfaceAttribPixelFormat) {
+            unsigned requested = attrs[i].value.value.i;
+            check(format == VA_RT_FORMAT_RGB32 ? is_rgb(requested) : requested == fourcc,
                   "surface pixel format does not match RT format",
                   VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
-        else if (attrs[i].type == VASurfaceAttribMemoryType)
+            fourcc = requested;
+        } else if (attrs[i].type == VASurfaceAttribMemoryType)
             memory_type = attrs[i].value.value.i;
         else if (attrs[i].type != VASurfaceAttribUsageHint)
             throw Error(VA_STATUS_ERROR_ATTR_NOT_SUPPORTED, "unsupported surface attribute");
@@ -527,8 +566,7 @@ API(
             memory_type == VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME
                 ? prime_descriptor(*static_cast<const VASurfaceAttribExternalBuffers *>(external))
                 : *static_cast<const VADRMPRIMESurfaceDescriptor *>(external);
-        imported = import_prime(desc, w, h,
-                                format == VA_RT_FORMAT_YUV420_10 ? VA_FOURCC_P010 : VA_FOURCC_NV12);
+        imported = import_prime(desc, w, h, fourcc);
     } else check(!external, "external descriptor without PRIME memory type",
                  VA_STATUS_ERROR_INVALID_PARAMETER);
     for (unsigned i = 0; i < count; ++i) {
@@ -538,7 +576,7 @@ API(
         s->width = w;
         s->height = h;
         s->allocation_count = count;
-        s->fourcc = format == VA_RT_FORMAT_YUV420_10 ? VA_FOURCC_P010 : VA_FOURCC_NV12;
+        s->fourcc = fourcc;
         ids[i] = d.next_id++;
         d.surfaces[ids[i]] = s;
     } return VA_STATUS_SUCCESS;)
@@ -847,7 +885,8 @@ API(query_error, (VADriverContextP ctx, VASurfaceID id, VAStatus status, void **
     (void)status; *info = nullptr; return VA_STATUS_SUCCESS;)
 API(query_images, (VADriverContextP ctx, VAImageFormat *out, int *count), (void)d;
     out[0] = image_format(VA_FOURCC_NV12); out[1] = image_format(VA_FOURCC_I420);
-    out[2] = image_format(VA_FOURCC_P010); *count = 3; return VA_STATUS_SUCCESS;)
+    out[2] = image_format(VA_FOURCC_P010); out[3] = image_format(VA_FOURCC_BGRA);
+    out[4] = image_format(VA_FOURCC_RGBA); *count = 5; return VA_STATUS_SUCCESS;)
 API(new_image, (VADriverContextP ctx, VAImageFormat *f, int w, int h, VAImage *out),
     *out = create_image(d, f->fourcc, w, h);
     return VA_STATUS_SUCCESS;)
@@ -864,12 +903,14 @@ API(
     if (!s->memory) s->memory = allocate_undecoded_surface(ctx, *s); auto m = s->memory;
     VAImage result{}; result.image_id = d.next_id++; result.buf = d.next_id++;
     result.format = image_format(m->fourcc); result.width = s->width; result.height = s->height;
-    result.data_size = m->size; result.num_planes = 2;
+    result.data_size = m->size; result.num_planes = is_rgb(m->fourcc) ? 1 : 2;
     result.pitches[0] = result.pitches[1] = m->stride; result.offsets[0] = m->data_offset;
-    result.offsets[1] = m->data_offset + m->stride * m->storage_height;
-    auto b = std::make_shared<Buffer>(); b->type = VAImageBufferType;
-    b->element_size = result.data_size; b->elements = 1; b->parent = s; b->memory = m;
-    ++s->derived_images; d.buffers[result.buf] = b;
+    result.offsets[1] = m->data_offset + m->stride * m->storage_height; if (is_rgb(m->fourcc)) {
+        result.pitches[1] = 0;
+        result.offsets[1] = 0;
+    } auto b = std::make_shared<Buffer>();
+    b->type = VAImageBufferType; b->element_size = result.data_size; b->elements = 1; b->parent = s;
+    b->memory = m; ++s->derived_images; d.buffers[result.buf] = b;
     try { d.images[result.image_id] = result; } catch (...) {
         d.buffers.erase(result.buf);
         throw;
@@ -883,24 +924,29 @@ API(
     synchronize(d, s); auto image = lookup(d.images, image_id, VA_STATUS_ERROR_INVALID_IMAGE);
     check(sw == dw && sh == dh, "image scaling unsupported", VA_STATUS_ERROR_UNIMPLEMENTED);
     check(sw && sh && sx >= 0 && sy >= 0 && dx >= 0 && dy >= 0 &&
-              !((sx | sy | dx | dy | sw | sh) & 1) && uint64_t(sx) + sw <= image.width &&
-              uint64_t(sy) + sh <= image.height && uint64_t(dx) + dw <= s->width &&
-              uint64_t(dy) + dh <= s->height,
+              (is_rgb(s->fourcc) || !((sx | sy | dx | dy | sw | sh) & 1)) &&
+              uint64_t(sx) + sw <= image.width && uint64_t(sy) + sh <= image.height &&
+              uint64_t(dx) + dw <= s->width && uint64_t(dy) + dh <= s->height,
           "invalid upload region", VA_STATUS_ERROR_INVALID_PARAMETER);
     check(!s->derived_images && !s->acquired_handles, "surface has derived images or handles",
           VA_STATUS_ERROR_SURFACE_BUSY);
-    check((s->fourcc == VA_FOURCC_P010) == (image.format.fourcc == VA_FOURCC_P010),
+    check((is_rgb(s->fourcc) || is_rgb(image.format.fourcc))
+              ? s->fourcc == image.format.fourcc
+              : (s->fourcc == VA_FOURCC_P010) == (image.format.fourcc == VA_FOURCC_P010),
           "image bit depth conversion unsupported", VA_STATUS_ERROR_INVALID_IMAGE_FORMAT);
     if (!s->memory) s->memory = allocate_undecoded_surface(ctx, *s); auto m = s->memory;
     auto source_buffer = buffer(d, image.buf); ImageMapping source(source_buffer);
     auto destination_buffer = std::make_shared<Buffer>(); destination_buffer->parent = s;
     destination_buffer->memory = m; ++s->derived_images;
     ImageMapping destination(destination_buffer);
-    unsigned bytes = s->fourcc == VA_FOURCC_P010 ? 2 : 1; for (unsigned row = 0; row < sh; ++row)
+    unsigned bytes = is_rgb(s->fourcc)             ? 4
+                     : s->fourcc == VA_FOURCC_P010 ? 2
+                                                   : 1;
+    for (unsigned row = 0; row < sh; ++row)
         std::memcpy(destination.data + m->data_offset + (dy + row) * m->stride + dx * bytes,
                     source.data + image.offsets[0] + (sy + row) * image.pitches[0] + sx * bytes,
                     sw *bytes);
-    for (unsigned row = 0; row < sh / 2; ++row) {
+    for (unsigned row = 0; !is_rgb(s->fourcc) && row < sh / 2; ++row) {
         auto uv = destination.data + m->data_offset +
                   (m->storage_height + dy / 2 + row) * m->stride + dx * bytes;
         if (image.format.fourcc == VA_FOURCC_I420) {
@@ -949,17 +995,21 @@ API(
     synchronize(d, s);
     check(!s->derived_images, "surface has derived images", VA_STATUS_ERROR_SURFACE_BUSY);
     auto image = lookup(d.images, image_id, VA_STATUS_ERROR_INVALID_IMAGE);
-    check(x >= 0 && y >= 0 && !(x & 1) && !(y & 1) && w <= image.width && h <= image.height &&
-              uint64_t(x) + w <= s->width && uint64_t(y) + h <= s->height,
+    check(x >= 0 && y >= 0 && (is_rgb(s->fourcc) || (!(x & 1) && !(y & 1))) && w <= image.width &&
+              h <= image.height && uint64_t(x) + w <= s->width && uint64_t(y) + h <= s->height,
           "invalid image region", VA_STATUS_ERROR_INVALID_PARAMETER);
     auto out = buffer(d, image.buf); ImageMapping destination(out); if (!s->memory) {
         std::memset(destination.data, 0, image.data_size);
         destination.finish();
         return VA_STATUS_SUCCESS;
     } auto m = s->memory;
-    check((m->fourcc == VA_FOURCC_P010) == (image.format.fourcc == VA_FOURCC_P010),
+    check((is_rgb(m->fourcc) || is_rgb(image.format.fourcc))
+              ? m->fourcc == image.format.fourcc
+              : (m->fourcc == VA_FOURCC_P010) == (image.format.fourcc == VA_FOURCC_P010),
           "image bit depth conversion unsupported", VA_STATUS_ERROR_INVALID_IMAGE_FORMAT);
-    unsigned bytes_per_sample = m->fourcc == VA_FOURCC_P010 ? 2 : 1;
+    unsigned bytes_per_sample = is_rgb(m->fourcc)             ? 4
+                                : m->fourcc == VA_FOURCC_P010 ? 2
+                                                              : 1;
     check(uint64_t(x) + w <= m->width && uint64_t(y) + h <= m->height,
           "image exceeds CAPTURE layout");
     uint8_t *base = m->map() + m->data_offset;
@@ -969,7 +1019,7 @@ API(
         std::memcpy(destination.data + image.offsets[0] + row * image.pitches[0],
                     base + (y + row) * m->stride + x * bytes_per_sample, w *bytes_per_sample);
     uint8_t *uv = base + m->stride * m->storage_height + (y / 2) * m->stride + x * bytes_per_sample;
-    for (unsigned row = 0; row < (h + 1) / 2; ++row) {
+    for (unsigned row = 0; !is_rgb(m->fourcc) && row < (h + 1) / 2; ++row) {
         if (image.format.fourcc != VA_FOURCC_I420)
             std::memcpy(destination.data + image.offsets[1] + row * image.pitches[1],
                         uv + row * m->stride, ((w + 1) & ~1u) * bytes_per_sample);
@@ -1009,8 +1059,14 @@ API(
         s->persistent_export = true;
     } desc.objects[0]
                                                                 .size = m->size;
-    desc.objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
-    if (!(flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS)) {
+    desc.objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR; if (is_rgb(m->fourcc)) {
+        desc.num_layers = 1;
+        desc.layers[0].drm_format =
+            m->fourcc == VA_FOURCC_BGRA ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_ABGR8888;
+        desc.layers[0].num_planes = 1;
+        desc.layers[0].pitch[0] = m->stride;
+        desc.layers[0].offset[0] = m->data_offset;
+    } else if (!(flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS)) {
         desc.num_layers = 2;
         desc.layers[0].drm_format = m->fourcc == VA_FOURCC_P010 ? DRM_FORMAT_R16 : DRM_FORMAT_R8;
         desc.layers[1].drm_format =
@@ -1083,7 +1139,7 @@ extern "C" VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
         ctx->max_entrypoints = 2;
         ctx->max_attributes = 16;
         // libva validates nonzero allocation bounds even when queries return no entries.
-        ctx->max_image_formats = 3;
+        ctx->max_image_formats = 5;
         ctx->max_subpic_formats = 1;
         ctx->max_display_attributes = 1;
         ctx->str_vendor = "Iris V4L2 stateful VA-API backend";

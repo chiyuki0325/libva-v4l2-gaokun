@@ -226,7 +226,8 @@ static void run_case(Case c) {
     va(vaInitialize(display, &major, &minor));
     VAConfigAttrib rt{VAConfigAttribRTFormat, 0};
     va(vaGetConfigAttributes(display, VAProfileNone, VAEntrypointVideoProc, &rt, 1));
-    require(rt.value == (VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10), "VPP render formats");
+    require(rt.value == (VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10 | VA_RT_FORMAT_RGB32),
+            "VPP render formats");
     VAConfigID config;
     VAContextID context;
     rt.value = c.dst_format == VA_FOURCC_P010 ? VA_RT_FORMAT_YUV420_10 : VA_RT_FORMAT_YUV420;
