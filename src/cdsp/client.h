@@ -2,6 +2,7 @@
 #ifndef CDSP_VPP_CLIENT_H
 #define CDSP_VPP_CLIENT_H
 #include "vpp_limits.h"
+#include "../overlay-params.h"
 #include <stddef.h>
 #include <stdint.h>
 #ifdef __cplusplus
@@ -50,6 +51,9 @@ int cdsp_vpp_scale(cdsp_vpp_context *ctx, const cdsp_vpp_frame *src, const cdsp_
 int cdsp_vpp_process(cdsp_vpp_context *ctx, const cdsp_vpp_frame *src, int src_format,
                      const cdsp_vpp_crop *crop, const cdsp_vpp_frame *dst, int dst_format,
                      uint64_t *dsp_usec);
+// Base and destination may be the same allocation only with identical layouts.
+int cdsp_vpp_overlay(cdsp_vpp_context *ctx, cdsp_vpp_buffer *base, cdsp_vpp_buffer *rgba,
+                     cdsp_vpp_buffer *dst, const OverlayParams *params, uint64_t *dsp_usec);
 // Clockwise CDSP_VPP_ROTATE_* rotation. Destination dimensions describe the
 // final rotated image; cropping uses source coordinates. All geometry is even.
 int cdsp_vpp_transform(cdsp_vpp_context *ctx, const cdsp_vpp_frame *src, int src_format,

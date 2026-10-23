@@ -16,4 +16,7 @@ interface iris_vpp : remote_handle64 {
                in long src_stride, in long dst_stride, in long src_y_offset, in long src_uv_offset,
                in long dst_y_offset, in long dst_uv_offset, in long worker_count,
                in long src_format, in long dst_format, in long rotation, rout unsigned long long usec);
+  long overlay(in sequence<uint8_t> base, in sequence<uint8_t> rgba,
+               inrout sequence<uint8_t> dst, in sequence<uint8_t> params,
+               in long worker_count, rout unsigned long long usec);
 };
