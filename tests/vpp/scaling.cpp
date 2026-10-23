@@ -243,9 +243,11 @@ static void run_case(Case c) {
                                                            : 0;
     require(formats == 3, "VPP surface formats");
     va(vaCreateContext(display, config, 0, 0, 0, nullptr, 0, &context));
-    unsigned n = 0;
-    va(vaQueryVideoProcFilters(display, context, nullptr, &n));
-    require(n == 0, "scaling has no filters");
+    VAProcFilterType filters[VAProcFilterCount]{};
+    unsigned n = VAProcFilterCount;
+    va(vaQueryVideoProcFilters(display, context, filters, &n));
+    require(n == 0 || (n == 1 && filters[0] == VAProcFilterHighDynamicRangeToneMapping),
+            "available VPP filters");
     VAProcPipelineCaps caps{};
     va(vaQueryVideoProcPipelineCaps(display, context, nullptr, 0, &caps));
     require(caps.num_input_pixel_formats == 2 && caps.num_output_pixel_formats == 2,
@@ -647,10 +649,10 @@ int main() {
             for (Case c : {Case{1920, 1080, 1920, 1080, false}, Case{1920, 1080, 3840, 2160, false},
                            Case{3840, 2160, 1920, 1080, false}, Case{1920, 1080, 1280, 720, false},
                            Case{64, 18, 128, 18, false}, Case{128, 36, 128, 18, false},
-                           Case{640, 384, 608, 360, true},
-                           Case{640, 384, 320, 180, true}, Case{80, 18, 160, 36, false},
-                           Case{80, 18, 112, 24, false}, Case{640, 400, 32, 20, false},
-                           Case{16, 2, 16, 2, false}, Case{32, 4, 16, 2, false}}) {
+                           Case{640, 384, 608, 360, true}, Case{640, 384, 320, 180, true},
+                           Case{80, 18, 160, 36, false}, Case{80, 18, 112, 24, false},
+                           Case{640, 400, 32, 20, false}, Case{16, 2, 16, 2, false},
+                           Case{32, 4, 16, 2, false}}) {
                 c.src_format = src;
                 c.dst_format = dst;
                 cases.push_back(c);

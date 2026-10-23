@@ -3,6 +3,11 @@
 #ifdef HAVE_CDSP_VPP
 #include "cdsp/client.h"
 #include <dlfcn.h>
+#endif
+#ifdef HAVE_VULKAN_VPP
+#include "vulkan/vpp.hpp"
+#endif
+#if defined(HAVE_CDSP_VPP) || defined(HAVE_VULKAN_VPP)
 #include <climits>
 #include <fcntl.h>
 #include <linux/dma-heap.h>
@@ -56,7 +61,9 @@ std::shared_ptr<CdspApi> load_cdsp_api() {
 } // namespace
 #endif
 bool vpp_supported(VAProfile profile, VAEntrypoint entrypoint) {
-#ifdef HAVE_CDSP_VPP
+#ifdef HAVE_VULKAN_VPP
+    return profile == VAProfileNone && entrypoint == VAEntrypointVideoProc;
+#elif defined(HAVE_CDSP_VPP)
     return profile == VAProfileNone && entrypoint == VAEntrypointVideoProc && bool(load_cdsp_api());
 #else
     (void)profile;
@@ -64,7 +71,7 @@ bool vpp_supported(VAProfile profile, VAEntrypoint entrypoint) {
     return false;
 #endif
 }
-void vpp_caps(VAProcPipelineCaps &caps) {
+void vpp_caps(VAProcPipelineCaps &caps, bool tone_mapping) {
     // These are driver-owned arrays, as consumed by FFmpeg and other VA clients.
     // Do not read the incoming structure: clients may pass it uninitialized.
     static VAProcColorStandardType colors[] = {VAProcColorStandardNone, VAProcColorStandardBT601,
@@ -77,19 +84,38 @@ void vpp_caps(VAProcPipelineCaps &caps) {
         sizeof(colors) / sizeof(colors[0]);
     caps.input_pixel_format = caps.output_pixel_format = formats;
     caps.num_input_pixel_formats = caps.num_output_pixel_formats = 2;
+    if (tone_mapping) {
+        caps.input_color_standards = &colors[3];
+        caps.output_color_standards = &colors[2];
+        caps.num_input_color_standards = caps.num_output_color_standards = 1;
+        caps.input_pixel_format = &formats[1];
+        caps.output_pixel_format = &formats[0];
+        caps.num_input_pixel_formats = caps.num_output_pixel_formats = 1;
+    }
     caps.min_input_width = caps.min_output_width = 2;
+#ifdef HAVE_CDSP_VPP
     caps.rotation_flags = (1 << VA_ROTATION_NONE) | (1 << VA_ROTATION_90) | (1 << VA_ROTATION_180) |
                           (1 << VA_ROTATION_270);
+#endif
     caps.min_input_height = caps.min_output_height = 2;
     caps.max_input_width = caps.max_output_width = 8192;
     caps.max_input_height = caps.max_output_height = 8192;
 }
+void vpp_filter(const Buffer &buffer) {
+    check(buffer.type == VAProcFilterParameterBufferType && buffer.elements == 1 &&
+              buffer.element_size >= sizeof(VAProcFilterParameterBufferHDRToneMapping),
+          "invalid VPP filter buffer", VA_STATUS_ERROR_INVALID_BUFFER);
+    VAProcFilterParameterBufferHDRToneMapping filter{};
+    std::memcpy(&filter, buffer.data.data(), sizeof(filter));
+    check(filter.type == VAProcFilterHighDynamicRangeToneMapping, "unsupported VPP filter",
+          VA_STATUS_ERROR_UNSUPPORTED_FILTER);
+}
 VppPicture vpp_picture(const Buffer &buffer, const std::shared_ptr<Surface> &source,
-                       const Surface &target) {
+                       const Surface &target, const Buffer *filter) {
     VAProcPipelineParameterBuffer p{};
     std::memcpy(&p, buffer.data.data(), sizeof(p));
-    check(!p.num_filters && !p.num_forward_references && !p.num_backward_references &&
-              !p.mirror_state && !p.blend_state && !p.num_additional_outputs &&
+    check(!p.num_forward_references && !p.num_backward_references && !p.mirror_state &&
+              !p.blend_state && !p.num_additional_outputs &&
               !(p.pipeline_flags & ~VA_PROC_PIPELINE_FAST) &&
               !(p.filter_flags & ~VA_FILTER_SCALING_MASK) && !p.input_surface_flag &&
               !p.output_surface_flag && !p.output_hdr_metadata,
@@ -99,18 +125,57 @@ VppPicture vpp_picture(const Buffer &buffer, const std::shared_ptr<Surface> &sou
     const auto &in = p.input_color_properties;
     const auto &out = p.output_color_properties;
     auto matches = [](unsigned a, unsigned b) { return !a || !b || a == b; };
-    check(matches(p.surface_color_standard, p.output_color_standard) &&
-              matches(in.color_range, out.color_range) &&
-              matches(in.chroma_sample_location, out.chroma_sample_location) &&
-              matches(in.colour_primaries, out.colour_primaries) &&
-              matches(in.transfer_characteristics, out.transfer_characteristics) &&
-              matches(in.matrix_coefficients, out.matrix_coefficients),
-          "VPP color conversion unsupported", VA_STATUS_ERROR_UNIMPLEMENTED);
+    if (!filter) {
+        check(matches(p.surface_color_standard, p.output_color_standard) &&
+                  matches(in.color_range, out.color_range) &&
+                  matches(in.chroma_sample_location, out.chroma_sample_location) &&
+                  matches(in.colour_primaries, out.colour_primaries) &&
+                  matches(in.transfer_characteristics, out.transfer_characteristics) &&
+                  matches(in.matrix_coefficients, out.matrix_coefficients),
+              "VPP color conversion unsupported", VA_STATUS_ERROR_UNIMPLEMENTED);
+    } else {
+        auto color = [](unsigned value, unsigned expected) {
+            return !value || value == 2 || value == expected; // ISO unspecified = 2.
+        };
+        check((p.surface_color_standard == VAProcColorStandardNone ||
+               p.surface_color_standard == VAProcColorStandardBT2020 ||
+               p.surface_color_standard == VAProcColorStandardExplicit) &&
+                  (p.output_color_standard == VAProcColorStandardNone ||
+                   p.output_color_standard == VAProcColorStandardBT709 ||
+                   p.output_color_standard == VAProcColorStandardExplicit) &&
+                  color(in.colour_primaries, 9) && color(in.transfer_characteristics, 16) &&
+                  color(in.matrix_coefficients, 9) && color(out.colour_primaries, 1) &&
+                  color(out.transfer_characteristics, 1) && color(out.matrix_coefficients, 1) &&
+                  matches(in.color_range, VA_SOURCE_RANGE_REDUCED) &&
+                  matches(out.color_range, VA_SOURCE_RANGE_REDUCED) &&
+                  matches(in.chroma_sample_location, out.chroma_sample_location),
+              "tone mapping requires limited-range BT.2020/PQ to BT.709",
+              VA_STATUS_ERROR_UNIMPLEMENTED);
+        check(source->fourcc == VA_FOURCC_P010 && target.fourcc == VA_FOURCC_NV12,
+              "tone mapping requires P010 input and NV12 output",
+              VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+    }
     check(!p.output_region ||
               (!p.output_region->x && !p.output_region->y &&
                p.output_region->width == target.width && p.output_region->height == target.height),
           "VPP output must cover the entire surface", VA_STATUS_ERROR_UNIMPLEMENTED);
     VppPicture picture;
+    if (filter) {
+        vpp_filter(*filter);
+        VAProcFilterParameterBufferHDRToneMapping hdr{};
+        std::memcpy(&hdr, filter->data.data(), sizeof(hdr));
+        check(hdr.data.metadata_type == VAProcHighDynamicRangeMetadataHDR10 && hdr.data.metadata &&
+                  hdr.data.metadata_size == sizeof(VAHdrMetaDataHDR10),
+              "invalid HDR10 input metadata", VA_STATUS_ERROR_INVALID_PARAMETER);
+        // Snapshot caller-owned metadata at RenderPicture; never retain its pointer.
+        VAHdrMetaDataHDR10 metadata{};
+        std::memcpy(&metadata, hdr.data.metadata, sizeof(metadata));
+        picture.tone_mapping = true;
+        float peak = metadata.max_content_light_level;
+        if (!peak)
+            peak = metadata.max_display_mastering_luminance / 10000.0f;
+        picture.source_peak = peak ? std::clamp(peak, 100.0f, 10000.0f) : 1000.0f;
+    }
     picture.source = source;
     picture.rotation = p.rotation_state;
     picture.region = p.surface_region ? *p.surface_region
@@ -134,9 +199,15 @@ VppPicture vpp_picture(const Buffer &buffer, const std::shared_ptr<Surface> &sou
               (source->fourcc == VA_FOURCC_NV12 || source->fourcc == VA_FOURCC_P010) &&
               (target.fourcc == VA_FOURCC_NV12 || target.fourcc == VA_FOURCC_P010),
           "VPP requires distinct NV12/P010 surfaces", VA_STATUS_ERROR_INVALID_SURFACE);
+#ifndef HAVE_CDSP_VPP
+    check(picture.tone_mapping && !picture.rotation && target.width == r.width &&
+              target.height == r.height,
+          "scaling, rotation and format conversion require CDSP VPP",
+          VA_STATUS_ERROR_UNIMPLEMENTED);
+#endif
     return picture;
 }
-#ifdef HAVE_CDSP_VPP
+#if defined(HAVE_CDSP_VPP) || defined(HAVE_VULKAN_VPP)
 namespace {
 std::shared_ptr<Memory> allocate_vpp_memory(const Surface &surface) {
     auto memory = std::make_shared<Memory>();
@@ -159,6 +230,7 @@ std::shared_ptr<Memory> allocate_vpp_memory(const Surface &surface) {
     memory->fd = data.fd;
     return memory;
 }
+#ifdef HAVE_CDSP_VPP
 cdsp_vpp_frame import_vpp_frame(Memory &memory, const Surface &surface,
                                 const std::shared_ptr<CdspApi> &api) {
     unsigned row_bytes = surface.width * (surface.fourcc == VA_FOURCC_P010 ? 2 : 1);
@@ -187,11 +259,22 @@ cdsp_vpp_frame import_vpp_frame(Memory &memory, const Surface &surface,
             memory.data_offset,
             memory.data_offset + size_t(memory.stride) * memory.storage_height};
 }
+#endif
 } // namespace
 struct Vpp::Impl {
-    std::shared_ptr<CdspApi> api = load_cdsp_api();
+    int render_fd;
+    std::shared_ptr<Surface> intermediate;
+#ifdef HAVE_VULKAN_VPP
+    bool vulkan_probed = false;
+    std::unique_ptr<VulkanVpp> vulkan;
+#endif
+#ifdef HAVE_CDSP_VPP
+    std::shared_ptr<CdspApi> api;
     cdsp_vpp_context *context = nullptr;
-    Impl() {
+    void initialize_cdsp() {
+        if (context)
+            return;
+        api = load_cdsp_api();
         check(bool(api), "CDSP VPP runtime unavailable", VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT);
         int e = api->create(&context, CDSP_VPP_MAX_WORKERS, 1); // Capped by available HVX contexts.
         if (e) {
@@ -200,12 +283,31 @@ struct Vpp::Impl {
         }
     }
     ~Impl() {
-        api->destroy(context);
+        if (context)
+            api->destroy(context);
     }
+#endif
+    explicit Impl(int fd) : render_fd(fd) {}
 };
-Vpp::Vpp() : impl_(std::make_unique<Impl>()) {}
+Vpp::Vpp(int render_fd) : impl_(std::make_unique<Impl>(render_fd)) {}
+bool Vpp::tone_mapping_supported() {
+#ifdef HAVE_VULKAN_VPP
+    if (!impl_->vulkan_probed) {
+        impl_->vulkan_probed = true;
+        try {
+            impl_->vulkan = std::make_unique<VulkanVpp>(impl_->render_fd);
+        } catch (const Error &error) {
+            trace("Vulkan VPP unavailable: %s", error.what());
+        }
+    }
+    return bool(impl_->vulkan);
+#else
+    return false;
+#endif
+}
 void Vpp::process(const VppPicture &picture, const std::shared_ptr<Surface> &target) {
-    const auto &source = picture.source;
+    auto source = picture.source;
+    auto region = picture.region;
     check(source && source->memory, "VPP source has no storage", VA_STATUS_ERROR_INVALID_SURFACE);
     if (!target->memory)
         target->memory = allocate_vpp_memory(*target);
@@ -217,9 +319,37 @@ void Vpp::process(const VppPicture &picture, const std::shared_ptr<Surface> &tar
     check(fstat(src.fd, &src_stat) == 0 && fstat(dst.fd, &dst_stat) == 0 &&
               (src_stat.st_dev != dst_stat.st_dev || src_stat.st_ino != dst_stat.st_ino),
           "VPP source and destination DMA-BUF alias", VA_STATUS_ERROR_INVALID_SURFACE);
-    auto in = import_vpp_frame(src, *source, impl_->api),
+#ifdef HAVE_VULKAN_VPP
+    if (picture.tone_mapping) {
+        check(tone_mapping_supported(), "Vulkan tone mapping unavailable",
+              VA_STATUS_ERROR_UNSUPPORTED_FILTER);
+        bool geometry =
+            picture.rotation || region.width != target->width || region.height != target->height;
+        if (!geometry) {
+            impl_->vulkan->process(picture, *target);
+            target->status = VA_STATUS_SUCCESS;
+            return;
+        }
+        auto &intermediate = impl_->intermediate;
+        if (!intermediate || intermediate->width != region.width ||
+            intermediate->height != region.height) {
+            auto resized = std::make_shared<Surface>();
+            resized->width = region.width;
+            resized->height = region.height;
+            resized->fourcc = VA_FOURCC_NV12;
+            resized->memory = allocate_vpp_memory(*resized);
+            intermediate = std::move(resized);
+        }
+        // Vulkan and CDSP share this allocation without CPU pixel access.
+        impl_->vulkan->process(picture, *intermediate);
+        source = intermediate;
+        region.x = region.y = 0;
+    }
+#endif
+#ifdef HAVE_CDSP_VPP
+    impl_->initialize_cdsp();
+    auto in = import_vpp_frame(*source->memory, *source, impl_->api),
          out = import_vpp_frame(dst, *target, impl_->api);
-    auto region = picture.region;
     cdsp_vpp_crop crop{unsigned(region.x), unsigned(region.y), region.width, region.height};
     uint64_t dsp_us = 0;
     int e = impl_->api->transform(
@@ -234,14 +364,20 @@ void Vpp::process(const VppPicture &picture, const std::shared_ptr<Surface> &tar
     trace("VPP CDSP %ux%u -> %ux%u rotation=%u src-fd=%d dst-fd=%d DSP=%llu us", region.width,
           region.height, target->width, target->height, picture.rotation * 90, src.fd, dst.fd,
           static_cast<unsigned long long>(dsp_us));
+#else
+    throw Error(VA_STATUS_ERROR_UNIMPLEMENTED, "processing requires CDSP VPP");
+#endif
 }
 #else
 struct Vpp::Impl {};
-Vpp::Vpp() {
-    throw Error(VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT, "CDSP VPP was disabled at build time");
+Vpp::Vpp(int) {
+    throw Error(VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT, "VPP was disabled at build time");
+}
+bool Vpp::tone_mapping_supported() {
+    return false;
 }
 void Vpp::process(const VppPicture &, const std::shared_ptr<Surface> &) {
-    throw Error(VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT, "CDSP VPP was disabled at build time");
+    throw Error(VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT, "VPP was disabled at build time");
 }
 #endif
 Vpp::~Vpp() = default;

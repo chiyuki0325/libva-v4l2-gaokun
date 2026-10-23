@@ -43,6 +43,18 @@ if have_cdsp_vpp
 endif
 summary('CDSP VPP', have_cdsp_vpp)
 
+vulkan_option = get_option('vulkan_vpp')
+vulkan = dependency('vulkan', version: '>=1.3', required: vulkan_option)
+glslang = find_program('glslangValidator', native: true, required: vulkan_option)
+have_vulkan_vpp = not vulkan_option.disabled() and vulkan.found() and glslang.found()
+vulkan_sources = []
+if have_vulkan_vpp
+  subdir('src/vulkan')
+  vpp_args += ['-DHAVE_VULKAN_VPP']
+  vpp_dependencies += [vulkan]
+endif
+summary('Vulkan VPP', have_vulkan_vpp)
+
 sources = files(
   'src/backend.cpp',
   'src/decoder.cpp',
@@ -59,7 +71,7 @@ driver_install_dir = get_option('libdir') / 'dri'
 
 shared_library(
   'v4l2_drv_video',
-  sources + copy_source,
+  sources + copy_source + vulkan_sources,
   dependencies: [va, drm, threads] + copy_dependencies + vpp_dependencies,
   cpp_args: vpp_args,
   name_prefix: '',
@@ -84,6 +96,7 @@ if formatter.found()
                    'src/cdsp/dsp.c', 'src/cdsp/filter.h', 'src/cdsp/client.h',
                    'src/cdsp/qurt_abi.h', 'src/cdsp/qurt_abi_checks.h',
                    'src/cdsp/skel.cpp', 'src/cdsp/skel.h', 'src/cdsp/vpp_limits.h')
+  sources += files('src/vulkan/vpp.cpp', 'src/vulkan/vpp.hpp')
   run_target('format', command: [formatter, '-i', '--style=file', sources, headers])
   run_target('format-check', command: [formatter, '--dry-run', '--Werror', '--style=file', sources, headers])
 endif

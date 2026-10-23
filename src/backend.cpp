@@ -154,7 +154,7 @@ static unsigned profile_format(VAProfile p) {
 }
 static unsigned render_formats(VAProfile profile, VAEntrypoint entrypoint) {
     return entrypoint == VAEntrypointVideoProc ? (VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10)
-                                             : profile_format(profile);
+                                               : profile_format(profile);
 }
 static unsigned profile_fourcc(VAProfile p) {
     return is_10bit(p) ? VA_FOURCC_P010 : VA_FOURCC_NV12;
@@ -276,7 +276,8 @@ API(
           "unsupported entrypoint", VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT);
     for (int i = 0; i < count; ++i) {
         if (entry == VAEntrypointVideoProc) {
-            attrs[i].value = attrs[i].type == VAConfigAttribRTFormat ? render_formats(profile, entry)
+            attrs[i].value = attrs[i].type == VAConfigAttribRTFormat
+                                 ? render_formats(profile, entry)
                              : (attrs[i].type == VAConfigAttribMaxPictureWidth ||
                                 attrs[i].type == VAConfigAttribMaxPictureHeight)
                                  ? 8192
@@ -548,7 +549,8 @@ API(destroy_surfaces, (VADriverContextP ctx, VASurfaceID *ids, int count),
     for (int i = 0; i < count; ++i) check(!surface(d, ids[i])->acquired_handles,
                                           "surface handle acquired", VA_STATUS_ERROR_SURFACE_BUSY);
     for (int i = 0; i < count; ++i) d.surfaces.erase(ids[i]); return VA_STATUS_SUCCESS;)
-API(create_context,
+API(
+    create_context,
     (VADriverContextP ctx, VAConfigID id, int w, int h, int flags, VASurfaceID *targets, int count,
      VAContextID *result),
     (void)flags;
@@ -563,8 +565,10 @@ API(create_context,
         check(w <= 3840 && h <= 2160 && !(w & 1) && !(h & 1), "unsupported encoder dimensions",
               VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
     for (int i = 0; i < count; ++i) surface(d, targets[i]); c->width = w; c->height = h;
-    c->internal_profile = c->profile; c->decode_surfaces = std::max(0, count);
-    if (processing) c->vpp = std::make_unique<Vpp>(); *result = d.next_id++;
+    c->internal_profile = c->profile; c->decode_surfaces = std::max(0, count); if (processing) {
+        check(ctx->drm_state, "VPP requires a DRM display", VA_STATUS_ERROR_INVALID_DISPLAY);
+        c->vpp = std::make_unique<Vpp>(static_cast<drm_state *>(ctx->drm_state)->fd);
+    } *result = d.next_id++;
     d.contexts[*result] = c; return VA_STATUS_SUCCESS;)
 API(
     destroy_context, (VADriverContextP ctx, VAContextID id), auto c = context(d, id);
@@ -585,7 +589,8 @@ API(create_buffer,
     check(result && size && count && uint64_t(size) * count <= 64 * 1024 * 1024,
           "invalid buffer size", VA_STATUS_ERROR_INVALID_PARAMETER);
     bool encoding = c->entrypoint == VAEntrypointEncSlice;
-    check(c->entrypoint == VAEntrypointVideoProc ? type == VAProcPipelineParameterBufferType
+    check(c->entrypoint == VAEntrypointVideoProc ? (type == VAProcPipelineParameterBufferType ||
+                                                    type == VAProcFilterParameterBufferType)
           : encoding
               ? (type == VAEncSequenceParameterBufferType ||
                  type == VAEncPictureParameterBufferType || type == VAEncSliceParameterBufferType ||
@@ -638,8 +643,7 @@ API(
     check(c->entrypoint == VAEntrypointVideoProc
               ? (s->fourcc == VA_FOURCC_NV12 || s->fourcc == VA_FOURCC_P010)
               : s->fourcc == profile_fourcc(c->internal_profile),
-          "surface format does not match context",
-          VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
+          "surface format does not match context", VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
     // Defer decoder creation until the target surface format is known.
     if (c->entrypoint == VAEntrypointVLD && !c->decoder) {
         unsigned rt_format =
@@ -714,6 +718,20 @@ template <class P> static void render_buffer(P &p, const std::shared_ptr<Buffer>
         p.pending_slices.clear();
     }
 }
+static std::shared_ptr<Buffer> processing_filter(Driver &driver, VAContextID id,
+                                                 const VABufferID *filters, unsigned count) {
+    check(count <= 1, "VPP supports one HDR filter", VA_STATUS_ERROR_UNSUPPORTED_FILTER);
+    if (!count)
+        return {};
+    check(filters, "null VPP filter list", VA_STATUS_ERROR_INVALID_PARAMETER);
+    auto filter = buffer(driver, filters[0]);
+    check(filter->context_id == id, "VPP filter belongs to another context",
+          VA_STATUS_ERROR_INVALID_BUFFER);
+    vpp_filter(*filter);
+    check(context(driver, id)->vpp->tone_mapping_supported(), "HDR tone mapping unavailable",
+          VA_STATUS_ERROR_UNSUPPORTED_FILTER);
+    return filter;
+}
 API(
     render_picture, (VADriverContextP ctx, VAContextID id, VABufferID *ids, int count),
     auto c = context(d, id);
@@ -728,7 +746,8 @@ API(
             VAProcPipelineParameterBuffer params{};
             std::memcpy(&params, b->data.data(), sizeof(params));
             auto source = surface(d, params.surface);
-            c->vpp_picture = vpp_picture(*b, source, *c->target);
+            auto filter = processing_filter(d, id, params.filters, params.num_filters);
+            c->vpp_picture = vpp_picture(*b, source, *c->target, filter.get());
         } else if (c->entrypoint == VAEntrypointEncSlice) {
             check(b->context_id == id, "encode buffer belongs to another context",
                   VA_STATUS_ERROR_INVALID_BUFFER);
@@ -1010,26 +1029,39 @@ API(
         desc.layers[0].offset[1] = m->data_offset + m->stride * m->storage_height;
     } return VA_STATUS_SUCCESS;)
 
-API(query_vpp_filters,
+API(
+    query_vpp_filters,
     (VADriverContextP ctx, VAContextID id, VAProcFilterType *filters, unsigned *count),
     check(context(d, id)->entrypoint == VAEntrypointVideoProc, "not a VPP context",
           VA_STATUS_ERROR_INVALID_CONTEXT);
-    (void)filters; check(count, "null filter count", VA_STATUS_ERROR_INVALID_PARAMETER); *count = 0;
-    return VA_STATUS_SUCCESS;)
+    check(count, "null filter count", VA_STATUS_ERROR_INVALID_PARAMETER);
+    unsigned capacity = *count; *count = context(d, id)->vpp->tone_mapping_supported() ? 1 : 0;
+    check(capacity >= *count, "filter list too small", VA_STATUS_ERROR_MAX_NUM_EXCEEDED);
+    if (*count) {
+        check(filters, "null filter list", VA_STATUS_ERROR_INVALID_PARAMETER);
+        filters[0] = VAProcFilterHighDynamicRangeToneMapping;
+    } return VA_STATUS_SUCCESS;)
 API(query_vpp_filter_caps,
     (VADriverContextP ctx, VAContextID id, VAProcFilterType type, void *caps, unsigned *count),
     check(context(d, id)->entrypoint == VAEntrypointVideoProc, "not a VPP context",
           VA_STATUS_ERROR_INVALID_CONTEXT);
-    (void)type; (void)caps;
-    check(count, "null filter caps count", VA_STATUS_ERROR_INVALID_PARAMETER); *count = 0;
-    return VA_STATUS_ERROR_UNSUPPORTED_FILTER;)
+    check(count, "null filter caps count", VA_STATUS_ERROR_INVALID_PARAMETER);
+    unsigned capacity = *count; *count = 0;
+    check(type == VAProcFilterHighDynamicRangeToneMapping &&
+              context(d, id)->vpp->tone_mapping_supported(),
+          "unsupported VPP filter", VA_STATUS_ERROR_UNSUPPORTED_FILTER);
+    *count = 1; check(capacity, "filter caps list too small", VA_STATUS_ERROR_MAX_NUM_EXCEEDED);
+    check(caps, "null filter caps", VA_STATUS_ERROR_INVALID_PARAMETER);
+    VAProcFilterCapHighDynamicRange hdr{}; hdr.metadata_type = VAProcHighDynamicRangeMetadataHDR10;
+    hdr.caps_flag = VA_TONE_MAPPING_HDR_TO_SDR; std::memcpy(caps, &hdr, sizeof(hdr));
+    return VA_STATUS_SUCCESS;)
 API(query_vpp_caps,
     (VADriverContextP ctx, VAContextID id, VABufferID *filters, unsigned count,
      VAProcPipelineCaps *caps),
     check(context(d, id)->entrypoint == VAEntrypointVideoProc, "not a VPP context",
           VA_STATUS_ERROR_INVALID_CONTEXT);
-    (void)filters; check(caps, "null pipeline caps", VA_STATUS_ERROR_INVALID_PARAMETER);
-    check(!count, "VPP filters unsupported", VA_STATUS_ERROR_UNSUPPORTED_FILTER); vpp_caps(*caps);
+    check(caps, "null pipeline caps", VA_STATUS_ERROR_INVALID_PARAMETER);
+    auto filter = processing_filter(d, id, filters, count); vpp_caps(*caps, bool(filter));
     return VA_STATUS_SUCCESS;)
 
 static VAStatus terminate(VADriverContextP ctx) {

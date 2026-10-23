@@ -6,8 +6,8 @@ pkgrel=1
 pkgdesc='VA-API backend for Qualcomm Iris stateful V4L2 M2M decoding and H.264/HEVC encoding'
 arch=('aarch64')
 license=('MIT' 'GPL-2.0-only') # backend MIT; bundled Linux patch GPL-2.0-only
-depends=('glibc' 'gcc-libs' 'libva' 'libdrm' 'mesa' 'libglvnd' 'qcom-fastrpc')
-makedepends=('meson' 'ninja' 'ghc' 'haskell-syb')
+depends=('glibc' 'gcc-libs' 'libva' 'libdrm' 'mesa' 'libglvnd' 'qcom-fastrpc' 'vulkan-icd-loader' 'vulkan-freedreno')
+makedepends=('meson' 'ninja' 'ghc' 'haskell-syb' 'vulkan-headers' 'glslang')
 # Native strip cannot process the Hexagon DSP skeleton.
 options=('!strip')
 source=("$pkgname-$pkgver.tar.gz")
@@ -25,7 +25,7 @@ build() {
   # earlier snapshot can silently package the old driver despite new sources.
   rm -rf "$srcdir/build"
   arch-meson "$srcdir/$pkgname-$pkgver" "$srcdir/build" \
-    -Dgpu_copy=enabled -Dcdsp_vpp=enabled -Dfastrpc=system
+    -Dgpu_copy=enabled -Dcdsp_vpp=enabled -Dfastrpc=system -Dvulkan_vpp=enabled
   meson compile -C "$srcdir/build"
 }
 

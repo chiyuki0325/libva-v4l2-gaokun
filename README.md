@@ -22,6 +22,7 @@ providing hardware decoding and encoding on **SC8280XP**, tested on
   NV12/P010; export uses PRIME2.
 - Optional CDSP VPP: NV12/P010 scaling, cropping, rotation and bit-depth
   conversion with persistent DMA-BUF mappings and no CPU pixel copies.
+- Optional Vulkan VPP: HDR10 P010 to SDR NV12 tone mapping with DMA-BUF zero-copy.
 - Identified decode errors produce gray frames with the Iris error-timestamp
   patch below; stalls remain errors.
 
@@ -105,6 +106,15 @@ ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \
   -hwaccel_output_format vaapi -i input.mp4 \
   -vf scale_vaapi=w=3840:h=2160:format=nv12 -c:v hevc_vaapi -bf 0 output.mp4
 ```
+
+## Vulkan video processing
+
+Use `tonemap_vaapi=format=nv12` for limited-range HDR10 P010 (BT.2020/PQ) to
+SDR NV12 (BT.709). Scaling/rotation also require CDSP.
+
+`-Dvulkan_vpp=enabled` (default: `auto`) requires Vulkan ≥ 1.3 headers/loader
+and `glslangValidator`. Runtime needs a compatible Vulkan driver and access to
+`/dev/dma_heap/system`; tested with Mesa Turnip on Adreno 690.
 
 ## Usage
 

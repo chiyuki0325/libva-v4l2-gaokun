@@ -54,6 +54,7 @@ struct Memory {
     unsigned data_offset = 0, fourcc = VA_FOURCC_NV12;
     bool queued = false;
     std::shared_ptr<void> vpp_registration;
+    std::shared_ptr<void> vulkan_registration;
     ~Memory();
     uint8_t *map();
 };
@@ -236,23 +237,27 @@ std::shared_ptr<Memory> allocate_surface(int render_fd, unsigned width, unsigned
 void fill_neutral_surface(Memory &memory, unsigned width, unsigned height);
 void wait_surface_access(const Memory &memory, short events);
 bool vpp_supported(VAProfile profile, VAEntrypoint entrypoint);
-void vpp_caps(VAProcPipelineCaps &caps);
+void vpp_caps(VAProcPipelineCaps &caps, bool tone_mapping = false);
+void vpp_filter(const Buffer &buffer);
 struct VppPicture {
     std::shared_ptr<Surface> source;
     VARectangle region{};
     unsigned rotation = VA_ROTATION_NONE;
+    bool tone_mapping = false;
+    float source_peak = 1000.0f;
 };
 class Vpp {
     struct Impl;
     std::unique_ptr<Impl> impl_;
 
   public:
-    Vpp();
+    explicit Vpp(int render_fd);
     ~Vpp();
+    bool tone_mapping_supported();
     void process(const VppPicture &picture, const std::shared_ptr<Surface> &target);
 };
 VppPicture vpp_picture(const Buffer &buffer, const std::shared_ptr<Surface> &source,
-                       const Surface &target);
+                       const Surface &target, const Buffer *filter);
 struct Context {
     VAProfile profile;
     VAProfile internal_profile;

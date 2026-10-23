@@ -1,0 +1,77 @@
+// SPDX-License-Identifier: MIT
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, std430) readonly buffer Input { uint16_t src[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Output { uint16_t dst[]; };
+layout(push_constant) uniform Params {
+    uint width, height, src_stride, src_y, src_uv, dst_stride, dst_y, dst_uv;
+    float source_pq, destination, knee;
+} p;
+
+vec3 decode_pq(vec3 code) {
+    vec3 t = pow(clamp(code, 0.0, 1.0), vec3(1.0 / 78.84375));
+    return 10000.0 * pow(max(t - 0.8359375, 0.0) / (18.8515625 - 18.6875*t),
+                        vec3(1.0 / 0.1593017578125));
+}
+float encode_pq(float nits) {
+    float t = pow(max(nits, 0.0) / 10000.0, 0.1593017578125);
+    return pow((0.8359375 + 18.8515625*t) / (1.0 + 18.6875*t), 78.84375);
+}
+ivec3 tone(ivec3 yuv) {
+    // Limited-range BT.2020 NCL / PQ to linear RGB, in cd/m².
+    vec3 c = (vec3(yuv) - vec3(64, 512, 512)) / vec3(876, 896, 896);
+    float r = c.x + 1.4746*c.z, b = c.x + 1.8814*c.y;
+    vec3 rgb = decode_pq(vec3(r, (c.x - .2627*r - .0593*b)/.678, b));
+    rgb = vec3(dot(rgb, vec3(1.660491, -.587641, -.072850)),
+               dot(rgb, vec3(-.124550, 1.132900, -.008349)),
+               dot(rgb, vec3(-.018151, -.100579, 1.118730)));
+    // Desaturate out-of-gamut negative channels at constant BT.709 luminance.
+    float luma = max(dot(rgb, vec3(.2126, .7152, .0722)), 0.0);
+    float negative = max(-min(min(rgb.x, rgb.y), rgb.z), 0.0);
+    rgb = (rgb + negative) * (luma / max(luma + negative, 1e-20));
+
+    // BT.2390-style Hermite shoulder in PQ space, with a zero-black,
+    // 100-nit SDR target. One gain for all channels preserves hue.
+    float maximum = max(max(rgb.x, rgb.y), rgb.z);
+    float mapped = maximum;
+    if (p.destination < 1.0) {
+        float x = min(encode_pq(maximum) / p.source_pq, 1.0);
+        float t = clamp((x - p.knee) / (1.0 - p.knee), 0.0, 1.0);
+        float shoulder = p.knee + (1.0 - p.knee)*t +
+                         (3.0*p.destination - p.knee - 2.0)*t*t +
+                         (p.knee + 1.0 - 2.0*p.destination)*t*t*t;
+        mapped = decode_pq(vec3((x < p.knee ? x : shoulder)*p.source_pq)).x;
+    }
+    float gain = mapped / max(maximum, 1e-20) / 100.0;
+    rgb = pow(clamp(rgb*gain, 0.0, 1.0), vec3(1.0/2.4));
+    float y = dot(rgb, vec3(.2126, .7152, .0722));
+    return ivec3(roundEven(vec3(64.0 + 876.0*y,
+        512.0 + (rgb.b-y)*(896.0/1.8556), 512.0 + (rgb.r-y)*(896.0/1.5748))));
+}
+uint pack_pair(ivec2 value) {
+    uvec2 bytes = uvec2(clamp(value, 0, 255));
+    return bytes.x | (bytes.y << 8);
+}
+void main() {
+    // Each invocation owns 4x2 pixels. Halfword stores also handle widths
+    // congruent to 2 modulo 4, without overlapping another invocation's bytes.
+    uint x = gl_GlobalInvocationID.x*4u, y = gl_GlobalInvocationID.y*2u;
+    if (x >= p.width || y >= p.height) return;
+    for (uint pair = 0u; pair < 2u; ++pair) {
+        uint column = x + pair*2u;
+        if (column >= p.width) break;
+        uint uv = (p.src_uv + (y/2u)*p.src_stride)/2u + column;
+        ivec2 chroma = ivec2(uint(src[uv]) >> 6, uint(src[uv+1u]) >> 6);
+        ivec2 sum = ivec2(0);
+        for (uint row = 0u; row < 2u; ++row) {
+            uint yy = (p.src_y + (y+row)*p.src_stride)/2u + column;
+            ivec3 a = tone(ivec3(int(uint(src[yy]) >> 6), chroma));
+            ivec3 b = tone(ivec3(int(uint(src[yy+1u]) >> 6), chroma));
+            dst[(p.dst_y + (y+row)*p.dst_stride + column)/2u] =
+                uint16_t(pack_pair((ivec2(a.x, b.x) + 2)/4));
+            sum += a.yz + b.yz;
+        }
+        dst[(p.dst_uv + (y/2u)*p.dst_stride + column)/2u] = uint16_t(pack_pair((sum+8)/16));
+    }
+}
