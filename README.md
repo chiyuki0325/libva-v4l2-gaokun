@@ -19,7 +19,7 @@ providing hardware decoding and encoding on **SC8280XP**, tested on
   HEVC uses Main tier; Main10 encoding is unsupported.
 - Compatible DMA-BUF paths avoid raw-frame copies; cached surfaces may need
   GPU or CPU copying. PRIME1/PRIME2 import accepts single-buffer linear
-  NV12/P010; export uses PRIME2.
+  NV12/P010/BGRA/RGBA; export uses PRIME2.
 - Optional CDSP VPP: NV12/P010 scaling, cropping, rotation and bit-depth
   conversion with persistent DMA-BUF mappings and no CPU pixel copies.
 - Optional Vulkan VPP: HDR10 P010 to SDR NV12 tone mapping with DMA-BUF zero-copy.
@@ -97,9 +97,9 @@ Debian disables it. See [CDSP build and runtime requirements](src/cdsp/README.md
 NV12/P010 scaling, conversion and clockwise 90°/180°/270° rotation can be
 combined. Dimensions and crop coordinates must be even, maximum dimension
 8192, reduction up to 20:1, both axes scaling in the same direction after
-rotation. Color matrix/range is preserved; no mirroring, interlacing,
-blending or partial output regions. Active workers follow the available
-HVX count, up to eight.
+rotation. Color matrix/range is preserved; the base layer fills the output.
+No mirroring or interlacing. Active workers follow the available HVX count,
+up to eight.
 
 ```sh
 ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \
@@ -111,6 +111,11 @@ ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \
 
 Use `tonemap_vaapi=format=nv12` for limited-range HDR10 P010 (BT.2020/PQ) to
 SDR NV12 (BT.709). Scaling/rotation also require CDSP.
+
+Both backends support `overlay_vaapi`: BGRA/RGBA layers over NV12/P010, including
+crop, bilinear scaling, clipping, global and per-pixel alpha. The default prefers
+Vulkan; `IRIS_VAAPI_OVERLAY=cdsp` or `vulkan` selects a backend. Processing shares
+DMA-BUFs without CPU pixel copies. YUV overlays and luma keying are unsupported.
 
 `-Dvulkan_vpp=enabled` (default: `auto`) requires Vulkan ≥ 1.3 headers/loader
 and `glslangValidator`. Runtime needs a compatible Vulkan driver and access to

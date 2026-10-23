@@ -94,6 +94,13 @@ imports and context lifetime. Build with the command in its header and run with
 the same driver environment; `--geometry` also checks combined HDR, scaling and
 rotation with CDSP. It reports warmed VAAPI call times for 1080p and 4K.
 
+`vpp/overlay.cpp` checks both overlay backends against a double-precision
+reference, including RGB upload/PRIME round trips, clipping, scaling, alpha,
+multiple layers, rejected submissions and parameter lifetimes. Build with the
+command in its header. `--geometry` adds combined base scaling; `--bench`
+measures warmed VAAPI submissions including the base copy, excluding uploads
+and encoding. Pass `cdsp` or `vulkan` to test a single backend.
+
 Optional ABI audit against SDK 6.7 (all six architectures):
 
 ```sh
