@@ -111,6 +111,12 @@ Checks NV12/P010 scaling, conversion and rotation, rounding, crop/output layouts
 DMA-BUF identity, persistent mapping and context/buffer lifetime. Also run
 against a `-Dfastrpc=bundled` build.
 
+`vpp/tonemap.cpp` checks Vulkan HDR10 → SDR against a double-precision reference,
+including metadata changes, padded/cropped layouts, DMA-BUF identity, persistent
+imports and context lifetime. Build with the command in its header and run with
+the same driver environment; `--geometry` also checks combined HDR, scaling and
+rotation with CDSP. It reports warmed VAAPI call times for 1080p and 4K.
+
 Optional ABI audit against SDK 6.7 (all six architectures):
 
 ```sh

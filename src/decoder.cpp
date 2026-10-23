@@ -40,8 +40,9 @@ bool expired(std::chrono::steady_clock::time_point start) {
 }
 } // namespace
 Memory::~Memory() {
-    // Release the DSP registration while its backing storage is still alive.
+    // Release device imports while their backing storage is still alive.
     vpp_registration.reset();
+    vulkan_registration.reset();
     if (mapping)
         munmap(mapping, size);
     if (fd >= 0)

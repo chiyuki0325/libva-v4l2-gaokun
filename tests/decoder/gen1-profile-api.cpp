@@ -32,7 +32,9 @@ static void expect(VAStatus status, VAStatus wanted = VA_STATUS_SUCCESS) {
 }
 
 int main(int argc, char **argv) {
-    require(argc == 2, "usage: gen1-profile-api /path/to/v4l2_drv_video.so");
+    require(argc == 2 || (argc == 3 && std::string(argv[2]) == "--vpp"),
+            "usage: gen1-profile-api /path/to/v4l2_drv_video.so [--vpp]");
+    bool have_vpp = argc == 3;
     void *module = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     require(module != nullptr, "load driver");
     auto initialize =
@@ -42,7 +44,7 @@ int main(int argc, char **argv) {
     VADriverContext driver{};
     driver.vtable = &table;
     expect(initialize(&driver));
-    require(driver.max_profiles == 7, "Gen1 profile allocation bound must be seven");
+    require(driver.max_profiles == 7 + have_vpp, "Gen1 profile allocation bound");
     require(driver.max_entrypoints == 1, "Gen1 must allocate one entrypoint per profile");
     std::vector<VAProfile> profiles(driver.max_profiles);
     int count = 0;
@@ -56,8 +58,11 @@ int main(int argc, char **argv) {
         VAProfileVP9Profile0,
         VAProfileVP9Profile2,
     };
-    require(count == driver.max_profiles && profiles == expected, "unexpected Gen1 profiles");
-    for (VAProfile profile : profiles) {
+    auto expected_profiles = expected;
+    if (have_vpp)
+        expected_profiles.push_back(VAProfileNone);
+    require(count == driver.max_profiles && profiles == expected_profiles, "unexpected Gen1 profiles");
+    for (VAProfile profile : expected) {
         VAEntrypoint entrypoint{};
         int entry_count = 0;
         expect(table.vaQueryConfigEntrypoints(&driver, profile, &entrypoint, &entry_count));
