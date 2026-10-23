@@ -3,6 +3,7 @@
 #include "vpp.hpp"
 #include <vulkan/vulkan.h>
 #include "tonemap_spirv.h"
+#include "overlay_spirv.h"
 #include <array>
 #include <cmath>
 #include <cerrno>
@@ -21,6 +22,7 @@ void vk_check(VkResult result, const char *operation) {
         throw Error(VA_STATUS_ERROR_OPERATION_FAILED, operation);
     }
 }
+static_assert(sizeof(OverlayParams) == 120, "overlay push constant ABI");
 struct Parameters {
     uint32_t width, height, src_stride, src_y, src_uv, dst_stride, dst_y, dst_uv;
     float source_pq, destination, knee;
@@ -80,6 +82,8 @@ struct VulkanVpp::Impl : std::enable_shared_from_this<Impl> {
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkShaderModule shader = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    VkShaderModule overlay_shader = VK_NULL_HANDLE;
+    VkPipeline overlay_pipeline = VK_NULL_HANDLE;
     VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
     VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
     VkCommandPool command_pool = VK_NULL_HANDLE;
@@ -92,6 +96,8 @@ struct VulkanVpp::Impl : std::enable_shared_from_this<Impl> {
             vkDestroyFence(device, fence, nullptr);
             vkDestroyCommandPool(device, command_pool, nullptr);
             vkDestroyDescriptorPool(device, descriptor_pool, nullptr);
+            vkDestroyPipeline(device, overlay_pipeline, nullptr);
+            vkDestroyShaderModule(device, overlay_shader, nullptr);
             vkDestroyPipeline(device, pipeline, nullptr);
             vkDestroyShaderModule(device, shader, nullptr);
             vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
@@ -201,17 +207,17 @@ struct VulkanVpp::Impl : std::enable_shared_from_this<Impl> {
         get_fd_properties = reinterpret_cast<PFN_vkGetMemoryFdPropertiesKHR>(
             vkGetDeviceProcAddr(device, "vkGetMemoryFdPropertiesKHR"));
         check(get_fd_properties, "Vulkan external memory entrypoint unavailable");
-        VkDescriptorSetLayoutBinding bindings[2]{};
-        for (unsigned i = 0; i < 2; ++i)
+        VkDescriptorSetLayoutBinding bindings[3]{};
+        for (unsigned i = 0; i < 3; ++i)
             bindings[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT,
                            nullptr};
         VkDescriptorSetLayoutCreateInfo set_info{};
         set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        set_info.bindingCount = 2;
+        set_info.bindingCount = 3;
         set_info.pBindings = bindings;
         vk_check(vkCreateDescriptorSetLayout(device, &set_info, nullptr, &set_layout),
                  "create descriptor layout");
-        VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Parameters)};
+        VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(OverlayParams)};
         VkPipelineLayoutCreateInfo layout_info{};
         layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         layout_info.setLayoutCount = 1;
@@ -235,7 +241,15 @@ struct VulkanVpp::Impl : std::enable_shared_from_this<Impl> {
         vk_check(
             vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline),
             "create pipeline");
-        VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2};
+        shader_info.codeSize = sizeof(overlay_spirv);
+        shader_info.pCode = overlay_spirv;
+        vk_check(vkCreateShaderModule(device, &shader_info, nullptr, &overlay_shader),
+                 "create overlay shader");
+        pipeline_info.stage.module = overlay_shader;
+        vk_check(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr,
+                                          &overlay_pipeline),
+                 "create overlay pipeline");
+        VkDescriptorPoolSize pool_size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
         VkDescriptorPoolCreateInfo pool_info{};
         pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pool_info.maxSets = 1;
@@ -320,6 +334,79 @@ struct VulkanVpp::Impl : std::enable_shared_from_this<Impl> {
         memory.vulkan_registration = imported;
         return imported;
     }
+    void dispatch(VkPipeline selected_pipeline, Memory *src, Memory *dst, Memory *rgba,
+                  const void *parameters, uint32_t parameter_size, unsigned groups_x,
+                  unsigned groups_y) {
+        std::lock_guard<std::mutex> guard(mutex);
+        Memory *memories[] = {src, dst, rgba ? rgba : src};
+        VkDescriptorBufferInfo buffers[3]{};
+        VkWriteDescriptorSet writes[3]{};
+        for (unsigned i = 0; i < 3; ++i) {
+            wait_surface_access(*memories[i], i == 1 ? POLLOUT : POLLIN);
+            buffers[i] = {import(*memories[i])->buffer, 0, memories[i]->size};
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = descriptor_set;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &buffers[i];
+        }
+        vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
+        vk_check(vkResetCommandPool(device, command_pool, 0), "reset command pool");
+        VkCommandBufferBeginInfo begin{};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vk_check(vkBeginCommandBuffer(commands, &begin), "begin command buffer");
+        // DMA-BUF producers/consumers are outside this Vulkan queue family. Import
+        // alone does not acquire ownership or replace their implicit fences.
+        VkBufferMemoryBarrier barriers[3]{};
+        unsigned barrier_count = 0;
+        for (unsigned i = 0; i < 3; ++i) {
+            if (i && buffers[i].buffer == buffers[0].buffer) {
+                if (i == 1)
+                    barriers[0].dstAccessMask |= VK_ACCESS_SHADER_WRITE_BIT;
+                continue;
+            }
+            unsigned j = barrier_count++;
+            barriers[j].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            barriers[j].dstAccessMask =
+                i == 1 ? VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT;
+            barriers[j].srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+            barriers[j].dstQueueFamilyIndex = family;
+            barriers[j].buffer = buffers[i].buffer;
+            barriers[j].size = VK_WHOLE_SIZE;
+        }
+        vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, barrier_count,
+                             barriers, 0, nullptr);
+        vkCmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, selected_pipeline);
+        vkCmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1,
+                                &descriptor_set, 0, nullptr);
+        vkCmdPushConstants(commands, pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                           parameter_size, parameters);
+        vkCmdDispatch(commands, groups_x, groups_y, 1);
+        for (unsigned i = 0; i < barrier_count; ++i) {
+            auto &barrier = barriers[i];
+            barrier.srcAccessMask = barrier.dstAccessMask;
+            barrier.dstAccessMask = 0;
+            barrier.srcQueueFamilyIndex = family;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+        }
+        vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, barrier_count,
+                             barriers, 0, nullptr);
+        vk_check(vkEndCommandBuffer(commands), "end command buffer");
+        vk_check(vkResetFences(device, 1, &fence), "reset fence");
+        VkSubmitInfo submit{};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &commands;
+        vk_check(vkQueueSubmit(queue, 1, &submit, fence), "submit VPP");
+        // Complete before returning buffers to CDSP, V4L2, or the VA caller. No CPU
+        // mapping or pixel copy is involved; imports persist for the Memory lifetime.
+        vk_check(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "wait for VPP");
+        publish_dma_buf(*memories[1]);
+    }
 };
 
 VulkanVpp::VulkanVpp(int render_fd) {
@@ -340,23 +427,6 @@ void VulkanVpp::process(const VppPicture &picture, Surface &target) {
     auto &dst = *target.memory;
     validate_layout(src, *picture.source);
     validate_layout(dst, target);
-    auto &gpu = *impl_;
-    std::lock_guard<std::mutex> guard(gpu.mutex);
-    auto input = gpu.import(src), output = gpu.import(dst);
-    wait_surface_access(src, POLLIN);
-    wait_surface_access(dst, POLLOUT);
-    VkDescriptorBufferInfo buffers[2] = {{input->buffer, 0, src.size},
-                                         {output->buffer, 0, dst.size}};
-    VkWriteDescriptorSet writes[2]{};
-    for (unsigned i = 0; i < 2; ++i) {
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = gpu.descriptor_set;
-        writes[i].dstBinding = i;
-        writes[i].descriptorCount = 1;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[i].pBufferInfo = &buffers[i];
-    }
-    vkUpdateDescriptorSets(gpu.device, 2, writes, 0, nullptr);
     auto crop = picture.region;
     double source_pq = encode_pq(picture.source_peak);
     trace("Vulkan tone mapping %ux%u peak=%g src=%u/%u/%u dst=%u/%u/%u", crop.width, crop.height,
@@ -375,51 +445,33 @@ void VulkanVpp::process(const VppPicture &picture, Surface &target) {
                       float(source_pq),
                       destination,
                       1.5f * destination - 0.5f};
-    vk_check(vkResetCommandPool(gpu.device, gpu.command_pool, 0), "reset command pool");
-    VkCommandBufferBeginInfo begin{};
-    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vk_check(vkBeginCommandBuffer(gpu.commands, &begin), "begin command buffer");
-    // DMA-BUF producers/consumers are outside this Vulkan queue family. Import
-    // alone does not acquire ownership or replace their implicit fences.
-    VkBufferMemoryBarrier barriers[2]{};
-    for (unsigned i = 0; i < 2; ++i) {
-        barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        barriers[i].dstAccessMask = i ? VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT;
-        barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
-        barriers[i].dstQueueFamilyIndex = gpu.family;
-        barriers[i].buffer = buffers[i].buffer;
-        barriers[i].size = VK_WHOLE_SIZE;
-    }
-    vkCmdPipelineBarrier(gpu.commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 2, barriers, 0,
-                         nullptr);
-    vkCmdBindPipeline(gpu.commands, VK_PIPELINE_BIND_POINT_COMPUTE, gpu.pipeline);
-    vkCmdBindDescriptorSets(gpu.commands, VK_PIPELINE_BIND_POINT_COMPUTE, gpu.pipeline_layout, 0, 1,
-                            &gpu.descriptor_set, 0, nullptr);
-    vkCmdPushConstants(gpu.commands, gpu.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                       sizeof(params), &params);
-    vkCmdDispatch(gpu.commands, (crop.width + 255) / 256, crop.height / 2, 1);
-    for (auto &barrier : barriers) {
-        barrier.srcAccessMask = barrier.dstAccessMask;
-        barrier.dstAccessMask = 0;
-        barrier.srcQueueFamilyIndex = gpu.family;
-        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
-    }
-    vkCmdPipelineBarrier(gpu.commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 2, barriers, 0,
-                         nullptr);
-    vk_check(vkEndCommandBuffer(gpu.commands), "end command buffer");
-    vk_check(vkResetFences(gpu.device, 1, &gpu.fence), "reset fence");
-    VkSubmitInfo submit{};
-    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &gpu.commands;
-    vk_check(vkQueueSubmit(gpu.queue, 1, &submit, gpu.fence), "submit tone mapping");
-    // Complete before returning buffers to CDSP, V4L2, or the VA caller. No CPU
-    // mapping or pixel copy is involved; imports persist for the Memory lifetime.
-    vk_check(vkWaitForFences(gpu.device, 1, &gpu.fence, VK_TRUE, UINT64_MAX),
-             "wait for tone mapping");
-    publish_dma_buf(dst);
+    impl_->dispatch(impl_->pipeline, &src, &dst, nullptr, &params, sizeof(params),
+                    (crop.width + 255) / 256, crop.height / 2);
 }
+void VulkanVpp::overlay(Surface &base, Surface &rgba, Surface &target,
+                        const OverlayParams &params) {
+    validate_layout(*base.memory, base);
+    validate_layout(*target.memory, target);
+    impl_->dispatch(impl_->overlay_pipeline, base.memory.get(), target.memory.get(),
+                    rgba.memory.get(), &params, sizeof(params), (target.width + 127) / 128,
+                    target.height / 2);
+}
+void VulkanVpp::copy(const VppPicture &picture, Surface &target) {
+    auto &src = *picture.source->memory, &dst = *target.memory;
+    validate_layout(src, *picture.source);
+    validate_layout(dst, target);
+    OverlayParams p{};
+    p.width = target.width;
+    p.height = target.height;
+    p.src_stride = src.stride;
+    p.src_y = src.data_offset;
+    p.src_uv = src.data_offset + src.stride * src.storage_height;
+    p.dst_stride = dst.stride;
+    p.dst_y = dst.data_offset;
+    p.dst_uv = dst.data_offset + dst.stride * dst.storage_height;
+    p.flags = target.fourcc == VA_FOURCC_P010 ? OVERLAY_P010 : 0;
+    impl_->dispatch(impl_->overlay_pipeline, &src, &dst, nullptr, &p, sizeof(p),
+                    (target.width + 127) / 128, target.height / 2);
+}
+
 } // namespace irisva

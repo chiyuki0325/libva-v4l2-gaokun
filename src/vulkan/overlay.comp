@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: MIT
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x=64) in;
+layout(set=0,binding=0,std430) readonly buffer Base { uint16_t base[]; };
+layout(set=0,binding=1,std430) buffer Output { uint16_t output_data[]; };
+layout(set=0,binding=2,std430) readonly buffer RGB { uint rgba[]; };
+// Matches OverlayParams in ../overlay-params.h.
+layout(push_constant,std430) uniform Parameters {
+    int width,height,src_stride,src_y,src_uv,dst_stride,dst_y,dst_uv;
+    int rgb_stride,rgb_offset,rgb_width,rgb_height,x,y,w,h,alpha,flags,step_x,step_y;
+    int matrix[9]; int black;
+} p;
+ivec4 pixel(ivec2 xy) {
+    uint bits=rgba[(p.rgb_offset+xy.y*p.rgb_stride+xy.x*4)/4];
+    ivec4 v=ivec4(bits&255u,(bits>>8)&255u,(bits>>16)&255u,bits>>24);
+    if ((p.flags&2)!=0) v.rgb=v.bgr;
+    v.rgb *= (p.flags&4)!=0 ? 255 : v.a;
+    return v;
+}
+ivec4 interpolate(ivec4 a,ivec4 b,int w) { return (a*(256-w)+b*w+128)>>8; }
+ivec4 sample_rgb(ivec2 xy) {
+    xy-=ivec2(p.x,p.y);
+    if (p.alpha==0 || any(lessThan(xy,ivec2(0))) || any(greaterThanEqual(xy,ivec2(p.w,p.h)))) return ivec4(0);
+    ivec4 v;
+    if (p.w==p.rgb_width && p.h==p.rgb_height) v=pixel(xy);
+    else {
+        ivec2 pos=clamp(xy*ivec2(p.step_x,p.step_y)+ivec2(p.step_x,p.step_y)/2-32768,
+                        ivec2(0),(ivec2(p.rgb_width,p.rgb_height)-1)<<16);
+        ivec2 a=pos>>16,b=min(a+1,ivec2(p.rgb_width,p.rgb_height)-1),f=(pos>>8)&255;
+        v=interpolate(interpolate(pixel(a),pixel(ivec2(b.x,a.y)),f.x),
+                      interpolate(pixel(ivec2(a.x,b.y)),pixel(b),f.x),f.y);
+    }
+    return (v*p.alpha+128)>>8;
+}
+int contribution(int row,ivec4 v) { return (p.matrix[row]*v.r+p.matrix[row+1]*v.g+p.matrix[row+2]*v.b+8192)>>14; }
+ivec2 load_pair(int offset,bool wide) {
+    uint first=uint(base[offset/2]);
+    return wide ? ivec2(first>>6,uint(base[offset/2+1])>>6) : ivec2(first&255u,first>>8);
+}
+void store_pair(int offset,ivec2 v,bool wide) {
+    v=clamp(v,ivec2(0),ivec2(wide?1023:255));
+    if (wide) { output_data[offset/2]=uint16_t(v.x<<6); output_data[offset/2+1]=uint16_t(v.y<<6); }
+    else output_data[offset/2]=uint16_t(v.x|(v.y<<8));
+}
+void main() {
+    int x=int(gl_GlobalInvocationID.x)*2,y=int(gl_GlobalInvocationID.y)*2;
+    if (x>=p.width) return;
+    bool wide=(p.flags&1)!=0; int bytes=wide?2:1,scale=wide?4:1;
+    int sum_a=0,sum_u=0,sum_v=0;
+    for (int row=0;row<2;++row) {
+        ivec2 v=load_pair(p.src_y+(y+row)*p.src_stride+x*bytes,wide);
+        for (int col=0;col<2;++col) {
+            ivec4 rgb=sample_rgb(ivec2(x+col,y+row));
+            v[col]=(v[col]*(255-rgb.a)+p.black*scale*rgb.a+contribution(0,rgb)*scale+127)/255;
+            sum_a+=rgb.a; sum_u+=contribution(3,rgb); sum_v+=contribution(6,rgb);
+        }
+        store_pair(p.dst_y+(y+row)*p.dst_stride+x*bytes,v,wide);
+    }
+    ivec2 uv=load_pair(p.src_uv+(y/2)*p.src_stride+x*bytes,wide);
+    uv=(uv*(1020-sum_a)+128*scale*sum_a+ivec2(sum_u,sum_v)*scale+510)/1020;
+    store_pair(p.dst_uv+(y/2)*p.dst_stride+x*bytes,uv,wide);
+}
