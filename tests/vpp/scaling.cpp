@@ -640,6 +640,18 @@ int main() {
     // bytes beyond the boundary. Include the portrait 2x transcode geometry.
     for (unsigned sf : {VA_FOURCC_NV12, VA_FOURCC_P010})
         for (unsigned df : {VA_FOURCC_NV12, VA_FOURCC_P010}) {
+            // Noninteger enlargement: overlapping vector tails, repeated phases,
+            // two-vector gathers near 1:1, and an unchanged horizontal axis.
+            for (Case c : {Case{66, 10, 88, 14, false}, Case{130, 10, 174, 14, false},
+                           Case{288, 162, 384, 216, false}, Case{256, 16, 258, 18, false},
+                           Case{130, 10, 130, 14, false}}) {
+                c.src_format = sf;
+                c.dst_format = df;
+                c.tight = true;
+                cases.push_back(c);
+            }
+            // Four-tap area rows also use the unrolled P010 vertical kernel.
+            cases.push_back({256, 24, 64, 6, false, sf, df});
             cases.push_back({720, 1280, 360, 640, false, sf, df});
             cases.push_back({64, 128, 96, 192, false, sf, df, VA_ROTATION_NONE, true});
             cases.push_back({128, 256, 64, 128, false, sf, df, VA_ROTATION_NONE, true});

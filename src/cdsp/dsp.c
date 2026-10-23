@@ -25,7 +25,8 @@ typedef struct AreaTile {
 typedef struct CubicTile {
     uint8_t indices[4][128], delta_controls[4][2][128];
     int16_t weights[4][64];
-    int use_delta[4], src_base, dst_offset, output_bytes, tap_count, spans_two_vectors;
+    int use_delta[4], single_vector_delta, src_base, dst_offset, output_bytes, tap_count,
+        spans_two_vectors;
     struct CubicTile *shared_pattern;
 } __attribute__((aligned(128))) CubicTile;
 // P010 filtering uses signed 16-bit rows and 32-bit accumulators. A tile
@@ -330,6 +331,9 @@ int iris_vpp_configure(remote_handle64 h, int src_width, int src_height, int dst
                         }
                     tile->use_delta[k] = conflict_free;
                 }
+                tile->single_vector_delta = tile->tap_count == 4 && !tile->spans_two_vectors &&
+                                            tile->use_delta[0] && tile->use_delta[1] &&
+                                            tile->use_delta[2] && tile->use_delta[3];
                 tile->shared_pattern = tile;
                 for (int j = 0; j < tile_index; j++) {
                     CubicTile *pattern = &state->cubic_tiles[plane_index][j];
@@ -413,12 +417,12 @@ int iris_vpp_configure(remote_handle64 h, int src_width, int src_height, int dst
     }
     return 0;
 }
-// Build this cache only when a P010 operation needs resampling. NV12-only
-// contexts retain their existing kernels and memory footprint.
+// P010 reduction uses wide tiles; enlargement shares the cubic routing cache.
+// Allocate a signed intermediate row only when a P010 operation resamples.
 static int prepare_wide_filters(ScalerState *state) {
     if (state->wide_rows)
         return 0;
-    for (int plane = 0; plane < 2 && state->dst_width != 2 * state->src_width; plane++) {
+    for (int plane = 0; plane < 2 && !state->cubic_rows; plane++) {
         int channels = plane ? 2 : 1;
         int capacity = 0;
         for (int x = 0; x < state->dst_width;) {
@@ -577,10 +581,42 @@ static void area_vertical(const uint8_t *src, int stride, uint8_t *row, int widt
 }
 // Preserve signed Q6 intermediates, including cubic undershoot/overshoot.
 // Q14 coefficients and 32-bit accumulators avoid early clipping and phase loss.
-static void cubic_vertical(const uint8_t *src, int stride, int16_t *row, int width, Filter *filter,
-                           int hvx) {
+// Keep vertical kernels out of the row dispatcher to limit register pressure.
+static __attribute__((noinline)) void cubic_vertical(const uint8_t *src, int stride,
+                                                     int16_t *restrict row, int width,
+                                                     const Filter *filter, int hvx) {
     int x = 0, shift = filter->shift - 6;
-    if (hvx)
+    if (hvx && width >= 128 && filter->tap_count == 4) {
+        const uint8_t *lines[4];
+        int weights[4];
+        for (int k = 0; k < 4; k++) {
+            lines[k] = src + filter->indices[k] * stride;
+            weights[k] = (uint32_t)(uint16_t)filter->weights[k] * 0x00010001u;
+        }
+        for (;;) {
+            // Recompute the last full vector instead of filtering a scalar
+            // tail. The overlapping read and write stay within this row.
+            if (x + 128 > width)
+                x = width - 128;
+            HVX_VectorPair even = Q6_W_vcombine_VV(Q6_V_vzero(), Q6_V_vzero()), odd = even;
+#pragma clang loop unroll(full)
+            for (int k = 0; k < 4; k++) {
+                HVX_VectorPair widened = Q6_Wuh_vzxt_Vub(*(const UnalignedVector *)(lines[k] + x));
+                even = Q6_Ww_vmpyacc_WwVhRh(even, Q6_V_lo_W(widened), weights[k]);
+                odd = Q6_Ww_vmpyacc_WwVhRh(odd, Q6_V_hi_W(widened), weights[k]);
+            }
+            HVX_Vector even_samples =
+                Q6_Vh_vasr_VwVwR_rnd_sat(Q6_V_hi_W(even), Q6_V_lo_W(even), shift);
+            HVX_Vector odd_samples =
+                Q6_Vh_vasr_VwVwR_rnd_sat(Q6_V_hi_W(odd), Q6_V_lo_W(odd), shift);
+            HVX_VectorPair v = Q6_W_vshuff_VVR(odd_samples, even_samples, -2);
+            *(UnalignedVector *)(row + x) = Q6_V_lo_W(v);
+            *(UnalignedVector *)(row + x + 64) = Q6_V_hi_W(v);
+            x += 128;
+            if (x == width)
+                break;
+        }
+    } else if (hvx)
         for (; x + 128 <= width; x += 128) {
             HVX_VectorPair even = Q6_W_vcombine_VV(Q6_V_vzero(), Q6_V_vzero()), odd = even;
             for (int k = 0; k < filter->tap_count; k++) {
@@ -695,12 +731,16 @@ static void cubic_horizontal_2x(ScalerState *state, int plane_index, uint8_t *ds
         }
     }
 }
+// NV12 Q6 and 10-bit Q4 intermediates share a numeric scale. Reuse the
+// gather patterns for both formats and round directly to the output bit depth.
 static void cubic_horizontal(ScalerState *state, int plane_index, uint8_t *dst, int16_t *row) {
     if (state->dst_width == 2 * state->src_width) {
         cubic_horizontal_2x(state, plane_index, dst, row);
         return;
     }
     int shift = state->horizontal_filters[plane_index][0].shift;
+    int p010 = state->dst_format == CDSP_VPP_P010;
+    int extra = p010 ? 4 : 6;
     HVX_Vector previous = Q6_V_vzero();
     for (int tile_index = 0; tile_index < state->cubic_tile_count[plane_index]; tile_index++) {
         CubicTile *tile = &state->cubic_tiles[plane_index][tile_index],
@@ -709,29 +749,53 @@ static void cubic_horizontal(ScalerState *state, int plane_index, uint8_t *dst, 
                    upper =
                        *(const UnalignedVector *)((const uint8_t *)(row + tile->src_base) + 128);
         HVX_VectorPair accumulator = Q6_W_vcombine_VV(Q6_V_vzero(), Q6_V_vzero());
-        for (int k = 0; k < tile->tap_count; k++) {
-            HVX_Vector indices = *(HVX_Vector *)pattern->indices[k], samples;
-            if (pattern->use_delta[k]) {
-                HVX_Vector lower_samples =
+        if (pattern->single_vector_delta) {
+            // Upsampling usually gathers all four taps from one vector. Keep
+            // that case branch-free inside the tap loop so LLVM can schedule
+            // the independent gathers and coefficient loads together.
+#pragma clang loop unroll(full)
+            for (int k = 0; k < 4; k++) {
+                HVX_Vector samples =
                     Q6_V_vdelta_VV(lower, *(HVX_Vector *)pattern->delta_controls[k][0]);
-                if (tile->spans_two_vectors) {
-                    HVX_Vector upper_samples =
-                        Q6_V_vdelta_VV(upper, *(HVX_Vector *)pattern->delta_controls[k][1]);
-                    samples = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VubVub(indices, Q6_V_vsplat_R(0x7f7f7f7f)),
-                                            upper_samples, lower_samples);
+                accumulator =
+                    Q6_Ww_vmpyacc_WwVhVh(accumulator, samples, *(HVX_Vector *)pattern->weights[k]);
+            }
+        } else
+            for (int k = 0; k < tile->tap_count; k++) {
+                HVX_Vector indices = *(HVX_Vector *)pattern->indices[k], samples;
+                if (pattern->use_delta[k]) {
+                    HVX_Vector lower_samples =
+                        Q6_V_vdelta_VV(lower, *(HVX_Vector *)pattern->delta_controls[k][0]);
+                    if (tile->spans_two_vectors) {
+                        HVX_Vector upper_samples =
+                            Q6_V_vdelta_VV(upper, *(HVX_Vector *)pattern->delta_controls[k][1]);
+                        samples =
+                            Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VubVub(indices, Q6_V_vsplat_R(0x7f7f7f7f)),
+                                          upper_samples, lower_samples);
+                    } else
+                        samples = lower_samples;
                 } else
-                    samples = lower_samples;
-            } else
-                samples = gather_bytes(indices, Q6_Vb_vshuff_Vb(lower), Q6_Vb_vshuff_Vb(upper),
-                                       tile->spans_two_vectors);
-            accumulator =
-                Q6_Ww_vmpyacc_WwVhVh(accumulator, samples, *(HVX_Vector *)pattern->weights[k]);
-        }
+                    samples = gather_bytes(indices, Q6_Vb_vshuff_Vb(lower), Q6_Vb_vshuff_Vb(upper),
+                                           tile->spans_two_vectors);
+                accumulator =
+                    Q6_Ww_vmpyacc_WwVhVh(accumulator, samples, *(HVX_Vector *)pattern->weights[k]);
+            }
         // The narrowing instruction masks its shift count to four bits. Drop the
-        // six fractional intermediate bits first; the final rounding is unchanged.
+        // fractional intermediate bits first; the final rounding is unchanged.
         HVX_Vector narrowed =
-            Q6_Vh_vasr_VwVwR_rnd_sat(Q6_Vw_vasr_VwR(Q6_V_hi_W(accumulator), 6),
-                                     Q6_Vw_vasr_VwR(Q6_V_lo_W(accumulator), 6), shift);
+            Q6_Vh_vasr_VwVwR_rnd_sat(Q6_Vw_vasr_VwR(Q6_V_hi_W(accumulator), extra),
+                                     Q6_Vw_vasr_VwR(Q6_V_lo_W(accumulator), extra), shift);
+        if (p010) {
+            narrowed = Q6_Vh_vmax_VhVh(narrowed, Q6_V_vzero());
+            narrowed = Q6_Vh_vmin_VhVh(narrowed, Q6_V_vsplat_R(0x03ff03ff));
+            HVX_Vector out = Q6_Vh_vasl_VhR(narrowed, 6);
+            uint8_t *target = dst + 2 * tile->dst_offset;
+            if (tile->output_bytes == 64)
+                *(UnalignedVector *)target = out;
+            else
+                store_partial_vector(target, out, 2 * tile->output_bytes);
+            continue;
+        }
         if (!(tile_index & 1) && tile_index + 1 < state->cubic_tile_count[plane_index]) {
             previous = narrowed;
             continue;
@@ -918,12 +982,36 @@ static void convert_row(const uint8_t *src, uint8_t *dst, int width, int src_for
             dst[x] = clamp_int((((const uint16_t *)src)[x] + 128) >> 8, 0, 255);
     }
 }
-static void wide_vertical(const uint8_t *src, int stride, int16_t *row, int width,
-                          const Filter *filter, int format, int hvx) {
+static __attribute__((noinline)) void wide_vertical(const uint8_t *src, int stride,
+                                                    int16_t *restrict row, int width,
+                                                    const Filter *filter, int format, int hvx) {
     // Q4 keeps 10-bit cubic overshoot within int16_t. Area uses the same
     // precision so conversion to 8 bits happens only after both filter passes.
     int shift = filter->shift - 4, x = 0;
-    if (hvx)
+    if (hvx && format == CDSP_VPP_P010 && filter->tap_count == 4 && width >= 64) {
+        const uint8_t *lines[4];
+        int weights[4];
+        for (int k = 0; k < 4; k++) {
+            lines[k] = src + filter->indices[k] * stride;
+            weights[k] = (uint32_t)(uint16_t)filter->weights[k] * 0x00010001u;
+        }
+        for (;;) {
+            if (x + 64 > width)
+                x = width - 64;
+            HVX_VectorPair sum = Q6_W_vcombine_VV(Q6_V_vzero(), Q6_V_vzero());
+#pragma clang loop unroll(full)
+            for (int k = 0; k < 4; k++) {
+                HVX_Vector samples =
+                    Q6_Vuh_vlsr_VuhR(*(const UnalignedVector *)(lines[k] + 2 * x), 6);
+                sum = Q6_Ww_vmpyacc_WwVhRh(sum, samples, weights[k]);
+            }
+            *(UnalignedVector *)(row + x) =
+                Q6_Vh_vasr_VwVwR_rnd_sat(Q6_V_hi_W(sum), Q6_V_lo_W(sum), shift);
+            x += 64;
+            if (x == width)
+                break;
+        }
+    } else if (hvx)
         for (; x + 64 <= width; x += 64) {
             HVX_VectorPair sum = Q6_W_vcombine_VV(Q6_V_vzero(), Q6_V_vzero());
             for (int k = 0; k < filter->tap_count; k++) {
@@ -1100,12 +1188,15 @@ static void process_rows(ScalerState *state, const uint8_t *src, uint8_t *dst, i
         if (hvx && state->src_format == CDSP_VPP_NV12 && state->dst_height == 2 * state->src_height)
             cubic_vertical_2x(src, src_stride, row, state->src_width,
                               &state->vertical_filters[plane][y]);
+        else if (state->src_format == CDSP_VPP_NV12 && state->cubic_rows)
+            cubic_vertical(src, src_stride, row, state->src_width,
+                           &state->vertical_filters[plane][y], hvx);
         else
             wide_vertical(src, src_stride, row, state->src_width,
                           &state->vertical_filters[plane][y], state->src_format, hvx);
         uint64_t middle = state->profiling ? HAP_perf_get_time_us() : 0;
-        if (hvx && state->dst_width == 2 * state->src_width)
-            cubic_horizontal_2x(state, plane, dst + (y - first_row) * dst_stride, row);
+        if (hvx && state->cubic_rows)
+            cubic_horizontal(state, plane, dst + (y - first_row) * dst_stride, row);
         else
             wide_horizontal(state, plane, dst + (y - first_row) * dst_stride, row, hvx);
         if (state->profiling) {
