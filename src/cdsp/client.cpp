@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <initializer_list>
 
 struct cdsp_vpp_context {
     remote_handle64 handle = 0;
@@ -253,4 +254,28 @@ extern "C" int cdsp_vpp_transform(cdsp_vpp_context *ctx, const cdsp_vpp_frame *s
         src->y_offset + (uint64_t)region.y * src->stride + region.x * src_bytes,
         src->uv_offset + (uint64_t)(region.y / 2) * src->stride + region.x * src_bytes,
         dst->y_offset, dst->uv_offset, ctx->workers, src_format, dst_format, rotation, us);
+}
+
+extern "C" int cdsp_vpp_overlay(cdsp_vpp_context *ctx, cdsp_vpp_buffer *base, cdsp_vpp_buffer *rgba,
+                                cdsp_vpp_buffer *dst, const OverlayParams *p, uint64_t *us) {
+    if (!ctx || !base || !rgba || !dst || !p || !us ||
+        !overlay_valid(p, base->size, rgba->size, dst->size))
+        return -EINVAL;
+    auto same = [](const cdsp_vpp_buffer *a, const cdsp_vpp_buffer *b) {
+        return a->dev == b->dev && a->ino == b->ino;
+    };
+    if (same(rgba, dst) || (same(base, dst) && (p->src_y != p->dst_y || p->src_uv != p->dst_uv ||
+                                                p->src_stride != p->dst_stride)))
+        return -EINVAL;
+    std::lock_guard<std::mutex> guard(ctx->lock);
+    for (auto buffer : {base, rgba, dst}) {
+        int e = wait_dma_buf_access(buffer->fd, buffer == dst ? POLLOUT : POLLIN);
+        if (!e)
+            e = ensure_dsp_map(*buffer);
+        if (e)
+            return e;
+    }
+    return iris_vpp_overlay(ctx->handle, (const uint8_t *)base->map, base->size,
+                            (const uint8_t *)rgba->map, rgba->size, (uint8_t *)dst->map, dst->size,
+                            (const uint8_t *)p, sizeof(*p), ctx->workers, us);
 }

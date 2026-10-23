@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "filter.h"
+#include "../overlay-params.h"
 #include "iris_vpp.h"
 #include "qurt_abi.h"
 #include "vpp_limits.h"
@@ -117,6 +118,9 @@ struct ScalerState {
     uint8_t *dst;
     int src_stride, dst_stride, src_y_offset, src_uv_offset, dst_y_offset, dst_uv_offset,
         worker_count;
+    int overlay_job;
+    OverlayParams overlay;
+    const uint8_t *rgba;
     int profiling;
     uint64_t profile_us[CDSP_VPP_PROFILE_COUNTERS]; // Per worker: Y/UV vertical/horizontal.
 };
@@ -547,6 +551,7 @@ static void store_partial_vector(uint8_t *dst, HVX_Vector value, int bytes) {
     if (end > 128)
         Q6_vmem_QRIV(Q6_Q_vsetq_R(end - 128), aligned + 1, value);
 }
+#include "overlay.h"
 // vlut32 selects 32-byte banks. Its inputs are byte-shuffled by the caller;
 // delta routing is the faster path when all requested lanes are conflict-free.
 static inline HVX_Vector gather_bytes(HVX_Vector indices, HVX_Vector lower, HVX_Vector upper,
@@ -1377,12 +1382,17 @@ static void worker_main(void *opaque) {
             break;
         worker->status = qurt_hvx_lock(QURT_HVX_MODE_128B);
         if (!worker->status) {
-            process_plane(state, state->src + state->src_y_offset, state->dst + state->dst_y_offset,
-                          state->src_stride, state->dst_stride, 0, 1, worker->worker_id,
-                          state->worker_count);
-            process_plane(state, state->src + state->src_uv_offset,
-                          state->dst + state->dst_uv_offset, state->src_stride, state->dst_stride,
-                          1, 1, worker->worker_id, state->worker_count);
+            if (state->overlay_job)
+                overlay_rows(&state->overlay, state->src, state->rgba, state->dst,
+                             worker->worker_id, state->worker_count, 1);
+            else {
+                process_plane(state, state->src + state->src_y_offset,
+                              state->dst + state->dst_y_offset, state->src_stride,
+                              state->dst_stride, 0, 1, worker->worker_id, state->worker_count);
+                process_plane(state, state->src + state->src_uv_offset,
+                              state->dst + state->dst_uv_offset, state->src_stride,
+                              state->dst_stride, 1, 1, worker->worker_id, state->worker_count);
+            }
             // Publish HVX stores before the RPC thread observes completion.
             qurt_mem_syncht();
             qurt_hvx_unlock();
@@ -1438,6 +1448,7 @@ int iris_vpp_transform(remote_handle64 h, const uint8_t *src, int src_size, uint
         !plane_fits_buffer(dst_size, dst_uv_offset, dst_stride, output_width * dst_bytes,
                            output_height / 2))
         return AEE_EBADPARM;
+    state->overlay_job = 0;
     state->rotation = rotation;
     state->src_format = src_format;
     state->dst_format = dst_format;
@@ -1500,4 +1511,42 @@ int iris_vpp_transform(remote_handle64 h, const uint8_t *src, int src_size, uint
         qurt_hvx_unlock();
     *us = HAP_perf_get_time_us() - start_us;
     return 0;
+}
+
+int iris_vpp_overlay(remote_handle64 h, const uint8_t *src, int src_size, const uint8_t *rgba,
+                     int rgba_size, uint8_t *dst, int dst_size, const uint8_t *params,
+                     int params_size, int worker_count, uint64_t *us) {
+    if (!h || !src || !rgba || !dst || !params || !us || src_size < 0 || rgba_size < 0 ||
+        dst_size < 0 || params_size != sizeof(OverlayParams) || worker_count < 0 ||
+        worker_count > CDSP_VPP_MAX_WORKERS)
+        return AEE_EBADPARM;
+    ScalerState *state = (ScalerState *)(uintptr_t)h;
+    memcpy(&state->overlay, params, sizeof(state->overlay));
+    if (!overlay_valid(&state->overlay, src_size, rgba_size, dst_size))
+        return AEE_EBADPARM;
+    state->overlay_job = 1;
+    state->src = src;
+    state->rgba = rgba;
+    state->dst = dst;
+    state->worker_count = worker_count;
+    uint64_t start = HAP_perf_get_time_us();
+    int status = 0;
+    if (worker_count > 1) {
+        for (int i = 0; i < worker_count; ++i)
+            qurt_sem_up(&state->workers[i].work);
+        for (int i = 0; i < worker_count; ++i) {
+            qurt_sem_down(&state->workers[i].done);
+            if (state->workers[i].status)
+                status = AEE_EFAILED;
+        }
+    } else {
+        if (worker_count && qurt_hvx_lock(QURT_HVX_MODE_128B))
+            return AEE_EFAILED;
+        overlay_rows(&state->overlay, src, rgba, dst, 0, 1, worker_count);
+        qurt_mem_syncht();
+        if (worker_count)
+            qurt_hvx_unlock();
+    }
+    *us = HAP_perf_get_time_us() - start;
+    return status;
 }

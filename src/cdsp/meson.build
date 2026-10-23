@@ -55,7 +55,7 @@ foreach arch : ['v68', 'v69', 'v73', 'v75', 'v79', 'v81']
     output: 'vpp_' + arch + '_skel.so',
     command: [python, files('build-dsp.py'), arch, hexagon, fastrpc_include_dir,
               meson.current_build_dir(), meson.current_source_dir(), '@OUTPUT@'],
-    depend_files: files('dsp.c', 'filter.h', 'qurt_abi.h', 'qurt_abi_checks.h', 'vpp_limits.h'),
+    depend_files: files('dsp.c', 'overlay.h', '../overlay-params.h', 'filter.h', 'qurt_abi.h', 'qurt_abi_checks.h', 'vpp_limits.h'),
     build_by_default: true, install: true, install_dir: get_option('cdsp_firmware_dir'))
 endforeach
 skel_args = ['-DIRIS_VPP_DSP_DIR="' + (get_option('prefix') / get_option('cdsp_firmware_dir')) + '"']

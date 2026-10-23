@@ -94,6 +94,7 @@ formatter = find_program('clang-format', required: false)
 if formatter.found()
   sources += files('src/cpu-copy.cpp', 'src/gpu-copy.cpp', 'src/cdsp/client.cpp',
                    'src/cdsp/dsp.c', 'src/cdsp/filter.h', 'src/cdsp/client.h',
+                   'src/overlay-params.h', 'src/cdsp/overlay.h',
                    'src/cdsp/qurt_abi.h', 'src/cdsp/qurt_abi_checks.h',
                    'src/cdsp/skel.cpp', 'src/cdsp/skel.h', 'src/cdsp/vpp_limits.h')
   sources += files('src/vulkan/vpp.cpp', 'src/vulkan/vpp.hpp')
