@@ -71,12 +71,14 @@ std::shared_ptr<Memory> allocate_surface(int render_fd, unsigned width, unsigned
     m->width = width;
     m->height = height;
     m->fourcc = fourcc;
-    unsigned bytes_per_sample = fourcc == VA_FOURCC_P010 ? 2 : 1;
+    unsigned bytes_per_sample = is_rgb(fourcc) ? 4 : fourcc == VA_FOURCC_P010 ? 2 : 1;
     m->stride = (width * bytes_per_sample + 127) & ~127u;
     m->storage_height = (height + 31) & ~31u;
     long page_size = sysconf(_SC_PAGESIZE);
     check(page_size > 0, "cannot determine page size");
-    size_t size = size_t(m->stride) * m->storage_height * 3 / 2;
+    size_t size = size_t(m->stride) * m->storage_height;
+    if (!is_rgb(fourcc))
+        size = size * 3 / 2;
     m->size = (size + size_t(page_size) - 1) / size_t(page_size) * size_t(page_size);
     int coherent = 0;
     m->fd = irisva_msm_allocate(render_fd, m->size, &coherent);
