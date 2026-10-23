@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "internal.hpp"
+#include "overlay-params.h"
+#include <cmath>
 #ifdef HAVE_CDSP_VPP
 #include "cdsp/client.h"
 #include <dlfcn.h>
@@ -26,6 +28,7 @@ struct CdspApi {
     decltype(&cdsp_vpp_import) import = nullptr;
     decltype(&cdsp_vpp_release) release = nullptr;
     decltype(&cdsp_vpp_transform) transform = nullptr;
+    decltype(&cdsp_vpp_overlay) overlay = nullptr;
     ~CdspApi() {
         if (library)
             dlclose(library);
@@ -54,6 +57,7 @@ std::shared_ptr<CdspApi> load_cdsp_api() {
     LOAD(import)
     LOAD(release)
     LOAD(transform)
+    LOAD(overlay)
 #undef LOAD
     cached = api;
     return api;
@@ -77,13 +81,15 @@ void vpp_caps(VAProcPipelineCaps &caps, bool tone_mapping) {
     static VAProcColorStandardType colors[] = {VAProcColorStandardNone, VAProcColorStandardBT601,
                                                VAProcColorStandardBT709, VAProcColorStandardBT2020,
                                                VAProcColorStandardExplicit};
-    static uint32_t formats[] = {VA_FOURCC_NV12, VA_FOURCC_P010};
+    static uint32_t formats[] = {VA_FOURCC_NV12, VA_FOURCC_P010, VA_FOURCC_BGRA, VA_FOURCC_RGBA};
     caps = {};
     caps.input_color_standards = caps.output_color_standards = colors;
     caps.num_input_color_standards = caps.num_output_color_standards =
         sizeof(colors) / sizeof(colors[0]);
     caps.input_pixel_format = caps.output_pixel_format = formats;
-    caps.num_input_pixel_formats = caps.num_output_pixel_formats = 2;
+    caps.num_input_pixel_formats = 4;
+    caps.num_output_pixel_formats = 2;
+    caps.blend_flags = VA_BLEND_GLOBAL_ALPHA | VA_BLEND_PREMULTIPLIED_ALPHA;
     if (tone_mapping) {
         caps.input_color_standards = &colors[3];
         caps.output_color_standards = &colors[2];
@@ -111,12 +117,11 @@ void vpp_filter(const Buffer &buffer) {
           VA_STATUS_ERROR_UNSUPPORTED_FILTER);
 }
 VppPicture vpp_picture(const Buffer &buffer, const std::shared_ptr<Surface> &source,
-                       const Surface &target, const Buffer *filter) {
+                       const Surface &target, const Buffer *filter, bool overlay) {
     VAProcPipelineParameterBuffer p{};
     std::memcpy(&p, buffer.data.data(), sizeof(p));
     check(!p.num_forward_references && !p.num_backward_references && !p.mirror_state &&
-              !p.blend_state && !p.num_additional_outputs &&
-              !(p.pipeline_flags & ~VA_PROC_PIPELINE_FAST) &&
+              !p.num_additional_outputs && !(p.pipeline_flags & ~VA_PROC_PIPELINE_FAST) &&
               !(p.filter_flags & ~VA_FILTER_SCALING_MASK) && !p.input_surface_flag &&
               !p.output_surface_flag && !p.output_hdr_metadata,
           "unsupported VPP processing operation", VA_STATUS_ERROR_UNIMPLEMENTED);
@@ -125,7 +130,7 @@ VppPicture vpp_picture(const Buffer &buffer, const std::shared_ptr<Surface> &sou
     const auto &in = p.input_color_properties;
     const auto &out = p.output_color_properties;
     auto matches = [](unsigned a, unsigned b) { return !a || !b || a == b; };
-    if (!filter) {
+    if (!filter && !overlay) {
         check(matches(p.surface_color_standard, p.output_color_standard) &&
                   matches(in.color_range, out.color_range) &&
                   matches(in.chroma_sample_location, out.chroma_sample_location) &&
@@ -133,7 +138,7 @@ VppPicture vpp_picture(const Buffer &buffer, const std::shared_ptr<Surface> &sou
                   matches(in.transfer_characteristics, out.transfer_characteristics) &&
                   matches(in.matrix_coefficients, out.matrix_coefficients),
               "VPP color conversion unsupported", VA_STATUS_ERROR_UNIMPLEMENTED);
-    } else {
+    } else if (filter) {
         auto color = [](unsigned value, unsigned expected) {
             return !value || value == 2 || value == expected; // ISO unspecified = 2.
         };
@@ -155,11 +160,39 @@ VppPicture vpp_picture(const Buffer &buffer, const std::shared_ptr<Surface> &sou
               "tone mapping requires P010 input and NV12 output",
               VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT);
     }
-    check(!p.output_region ||
-              (!p.output_region->x && !p.output_region->y &&
-               p.output_region->width == target.width && p.output_region->height == target.height),
-          "VPP output must cover the entire surface", VA_STATUS_ERROR_UNIMPLEMENTED);
     VppPicture picture;
+    picture.color_standard = p.output_color_standard;
+    picture.color_properties = p.output_color_properties;
+    picture.output = p.output_region ? *p.output_region
+                                     : VARectangle{0, 0, static_cast<uint16_t>(target.width),
+                                                   static_cast<uint16_t>(target.height)};
+    if (p.blend_state)
+        picture.blend = *p.blend_state;
+    if (overlay) {
+        check(!filter && !p.rotation_state && is_rgb(source->fourcc) && source.get() != &target,
+              "overlay requires a distinct BGRA/RGBA surface without filters or rotation",
+              VA_STATUS_ERROR_UNIMPLEMENTED);
+        check(!(picture.blend.flags & ~(VA_BLEND_GLOBAL_ALPHA | VA_BLEND_PREMULTIPLIED_ALPHA)) &&
+                  (!(picture.blend.flags & VA_BLEND_GLOBAL_ALPHA) ||
+                   (std::isfinite(picture.blend.global_alpha) && picture.blend.global_alpha >= 0 &&
+                    picture.blend.global_alpha <= 1)),
+              "unsupported overlay blend state", VA_STATUS_ERROR_INVALID_PARAMETER);
+        picture.source = source;
+        picture.region = p.surface_region ? *p.surface_region
+                                          : VARectangle{0, 0, static_cast<uint16_t>(source->width),
+                                                        static_cast<uint16_t>(source->height)};
+        auto r = picture.region;
+        check(r.x >= 0 && r.y >= 0 && r.width && r.height &&
+                  unsigned(r.x) + r.width <= source->width &&
+                  unsigned(r.y) + r.height <= source->height && picture.output.width &&
+                  picture.output.height && picture.output.width <= 8192 &&
+                  picture.output.height <= 8192,
+              "invalid overlay rectangle", VA_STATUS_ERROR_INVALID_PARAMETER);
+        return picture;
+    }
+    check(!p.blend_state && !picture.output.x && !picture.output.y &&
+              picture.output.width == target.width && picture.output.height == target.height,
+          "VPP base layer must cover the output without blending", VA_STATUS_ERROR_UNIMPLEMENTED);
     if (filter) {
         vpp_filter(*filter);
         VAProcFilterParameterBufferHDRToneMapping hdr{};
@@ -200,8 +233,8 @@ VppPicture vpp_picture(const Buffer &buffer, const std::shared_ptr<Surface> &sou
               (target.fourcc == VA_FOURCC_NV12 || target.fourcc == VA_FOURCC_P010),
           "VPP requires distinct NV12/P010 surfaces", VA_STATUS_ERROR_INVALID_SURFACE);
 #ifndef HAVE_CDSP_VPP
-    check(picture.tone_mapping && !picture.rotation && target.width == r.width &&
-              target.height == r.height,
+    check(!picture.rotation && target.width == r.width && target.height == r.height &&
+              (picture.tone_mapping || source->fourcc == target.fourcc),
           "scaling, rotation and format conversion require CDSP VPP",
           VA_STATUS_ERROR_UNIMPLEMENTED);
 #endif
@@ -233,13 +266,17 @@ std::shared_ptr<Memory> allocate_vpp_memory(const Surface &surface) {
 #ifdef HAVE_CDSP_VPP
 cdsp_vpp_frame import_vpp_frame(Memory &memory, const Surface &surface,
                                 const std::shared_ptr<CdspApi> &api) {
-    unsigned row_bytes = surface.width * (surface.fourcc == VA_FOURCC_P010 ? 2 : 1);
+    unsigned row_bytes = surface.width * (is_rgb(surface.fourcc)             ? 4
+                                          : surface.fourcc == VA_FOURCC_P010 ? 2
+                                                                             : 1);
     check(memory.fd >= 0 && memory.fourcc == surface.fourcc && memory.size <= INT_MAX &&
               memory.width >= surface.width && memory.height >= surface.height &&
               memory.stride >= row_bytes && memory.storage_height >= surface.height &&
               uint64_t(memory.data_offset) +
                       uint64_t(memory.stride) *
-                          (uint64_t(memory.storage_height) + surface.height / 2 - 1) +
+                          (is_rgb(surface.fourcc)
+                               ? surface.height - 1
+                               : uint64_t(memory.storage_height) + surface.height / 2 - 1) +
                       row_bytes <=
                   memory.size,
           "unsupported CDSP DMA-BUF layout", VA_STATUS_ERROR_INVALID_SURFACE);
@@ -290,7 +327,7 @@ struct Vpp::Impl {
     explicit Impl(int fd) : render_fd(fd) {}
 };
 Vpp::Vpp(int render_fd) : impl_(std::make_unique<Impl>(render_fd)) {}
-bool Vpp::tone_mapping_supported() {
+bool Vpp::vulkan_available() {
 #ifdef HAVE_VULKAN_VPP
     if (!impl_->vulkan_probed) {
         impl_->vulkan_probed = true;
@@ -305,7 +342,10 @@ bool Vpp::tone_mapping_supported() {
     return false;
 #endif
 }
-void Vpp::process(const VppPicture &picture, const std::shared_ptr<Surface> &target) {
+bool Vpp::tone_mapping_supported() {
+    return vulkan_available();
+}
+void Vpp::process_single(const VppPicture &picture, const std::shared_ptr<Surface> &target) {
     auto source = picture.source;
     auto region = picture.region;
     check(source && source->memory, "VPP source has no storage", VA_STATUS_ERROR_INVALID_SURFACE);
@@ -368,6 +408,164 @@ void Vpp::process(const VppPicture &picture, const std::shared_ptr<Surface> &tar
     throw Error(VA_STATUS_ERROR_UNIMPLEMENTED, "processing requires CDSP VPP");
 #endif
 }
+namespace {
+OverlayParams overlay_parameters(const VppPicture &layer, const Surface &base,
+                                 const Surface &target, const VppPicture &background) {
+    const auto &src = *base.memory, &dst = *target.memory, &rgb = *layer.source->memory;
+    auto r = layer.region, out = layer.output;
+    OverlayParams p{};
+    p.width = target.width;
+    p.height = target.height;
+    p.src_stride = src.stride;
+    p.src_y = src.data_offset;
+    p.src_uv = src.data_offset + src.stride * src.storage_height;
+    p.dst_stride = dst.stride;
+    p.dst_y = dst.data_offset;
+    p.dst_uv = dst.data_offset + dst.stride * dst.storage_height;
+    p.rgb_stride = rgb.stride;
+    p.rgb_offset = rgb.data_offset + r.y * rgb.stride + r.x * 4;
+    p.rgb_width = r.width;
+    p.rgb_height = r.height;
+    p.x = out.x;
+    p.y = out.y;
+    p.w = out.width;
+    p.h = out.height;
+    p.alpha = (layer.blend.flags & VA_BLEND_GLOBAL_ALPHA)
+                  ? std::lround(layer.blend.global_alpha * 256)
+                  : 256;
+    p.flags = (target.fourcc == VA_FOURCC_P010 ? OVERLAY_P010 : 0) |
+              (layer.source->fourcc == VA_FOURCC_BGRA ? OVERLAY_BGRA : 0) |
+              (layer.blend.flags & VA_BLEND_PREMULTIPLIED_ALPHA ? OVERLAY_PREMULTIPLIED : 0);
+    p.step_x = (p.rgb_width << 16) / p.w;
+    p.step_y = (p.rgb_height << 16) / p.h;
+    auto standard = background.color_standard;
+    auto props = background.color_properties;
+    double kr = 0.2126, kb = 0.0722;
+    if (standard == VAProcColorStandardBT601 ||
+        ((standard == VAProcColorStandardExplicit || standard == VAProcColorStandardNone) &&
+         (props.matrix_coefficients == 5 || props.matrix_coefficients == 6))) {
+        kr = 0.299;
+        kb = 0.114;
+    } else if (standard == VAProcColorStandardBT2020 ||
+               ((standard == VAProcColorStandardExplicit || standard == VAProcColorStandardNone) &&
+                props.matrix_coefficients == 9)) {
+        kr = 0.2627;
+        kb = 0.0593;
+    } else {
+        check((standard == VAProcColorStandardNone || standard == VAProcColorStandardBT709 ||
+               standard == VAProcColorStandardExplicit) &&
+                  (!props.matrix_coefficients || props.matrix_coefficients == 1 ||
+                   props.matrix_coefficients == 2),
+              "unsupported overlay output matrix", VA_STATUS_ERROR_UNIMPLEMENTED);
+    }
+    check(!props.color_range || props.color_range == VA_SOURCE_RANGE_REDUCED ||
+              props.color_range == VA_SOURCE_RANGE_FULL,
+          "unsupported overlay output range", VA_STATUS_ERROR_UNIMPLEMENTED);
+    double kg = 1 - kr - kb;
+    bool full = props.color_range == VA_SOURCE_RANGE_FULL;
+    double ys = full ? 1 : 219.0 / 255, cs = full ? 1 : 224.0 / 255;
+    double matrix[] = {kr * ys,
+                       kg * ys,
+                       kb * ys,
+                       -kr * cs / (2 * (1 - kb)),
+                       -kg * cs / (2 * (1 - kb)),
+                       cs / 2,
+                       cs / 2,
+                       -kg * cs / (2 * (1 - kr)),
+                       -kb * cs / (2 * (1 - kr))};
+    for (unsigned i = 0; i < 9; ++i)
+        p.matrix[i] = std::lround(matrix[i] * 16384);
+    p.black = full ? 0 : 16;
+    check(overlay_valid(&p, src.size, rgb.size, dst.size), "invalid overlay memory layout",
+          VA_STATUS_ERROR_INVALID_SURFACE);
+    return p;
+}
+} // namespace
+void Vpp::process(const std::vector<VppPicture> &pictures, const std::shared_ptr<Surface> &target) {
+    check(!pictures.empty(), "missing VPP base layer", VA_STATUS_ERROR_INVALID_PARAMETER);
+    if (!target->memory)
+        target->memory = allocate_vpp_memory(*target);
+    check(target->memory->origin != MemoryOrigin::Iris, "VPP cannot overwrite decoder references",
+          VA_STATUS_ERROR_INVALID_SURFACE);
+    struct stat dst_stat{};
+    check(fstat(target->memory->fd, &dst_stat) == 0, "stat VPP output");
+    for (const auto &picture : pictures) {
+        check(picture.source && picture.source->memory, "VPP source has no storage",
+              VA_STATUS_ERROR_INVALID_SURFACE);
+        struct stat src_stat{};
+        check(fstat(picture.source->memory->fd, &src_stat) == 0 &&
+                  (src_stat.st_dev != dst_stat.st_dev || src_stat.st_ino != dst_stat.st_ino),
+              "VPP source and destination DMA-BUF alias", VA_STATUS_ERROR_INVALID_SURFACE);
+    }
+    auto base = pictures[0].source;
+    const auto &background = pictures[0];
+    bool direct = !background.tone_mapping && !background.rotation && !background.region.x &&
+                  !background.region.y && background.region.width == target->width &&
+                  background.region.height == target->height && base->fourcc == target->fourcc;
+    std::vector<OverlayParams> params;
+    for (size_t i = 1; i < pictures.size(); ++i)
+        params.push_back(overlay_parameters(pictures[i], direct && i == 1 ? *base : *target,
+                                            *target, background));
+    if (pictures.size() == 1) {
+#ifdef HAVE_CDSP_VPP
+        process_single(background, target);
+#else
+        if (background.tone_mapping)
+            process_single(background, target);
+        else {
+            check(direct && vulkan_available(), "Vulkan copy unavailable",
+                  VA_STATUS_ERROR_UNIMPLEMENTED);
+            impl_->vulkan->copy(background, *target);
+        }
+#endif
+        return;
+    }
+    const char *requested = std::getenv("IRIS_VAAPI_OVERLAY");
+    check(!requested || !std::strcmp(requested, "auto") || !std::strcmp(requested, "cdsp") ||
+              !std::strcmp(requested, "vulkan"),
+          "IRIS_VAAPI_OVERLAY must be auto, cdsp or vulkan", VA_STATUS_ERROR_INVALID_PARAMETER);
+    bool gpu = false;
+#ifdef HAVE_VULKAN_VPP
+    gpu = (!requested || std::strcmp(requested, "cdsp")) && vulkan_available();
+#endif
+    check(!requested || std::strcmp(requested, "vulkan") || gpu, "Vulkan overlay unavailable",
+          VA_STATUS_ERROR_UNIMPLEMENTED);
+#ifndef HAVE_CDSP_VPP
+    check(gpu, "CDSP overlay was disabled at build time", VA_STATUS_ERROR_UNIMPLEMENTED);
+#else
+    if (!gpu)
+        impl_->initialize_cdsp();
+#endif
+    if (!direct) {
+        process_single(background, target);
+        base = target;
+    }
+    for (size_t i = 1; i < pictures.size(); ++i) {
+#ifdef HAVE_VULKAN_VPP
+        if (gpu)
+            impl_->vulkan->overlay(*base, *pictures[i].source, *target, params[i - 1]);
+#endif
+#ifdef HAVE_CDSP_VPP
+        if (!gpu) {
+            auto src = import_vpp_frame(*base->memory, *base, impl_->api);
+            auto rgb =
+                import_vpp_frame(*pictures[i].source->memory, *pictures[i].source, impl_->api);
+            auto dst = import_vpp_frame(*target->memory, *target, impl_->api);
+            uint64_t us = 0;
+            int error = impl_->api->overlay(impl_->context, src.buffer, rgb.buffer, dst.buffer,
+                                            &params[i - 1], &us);
+            if (error)
+                trace("CDSP overlay failed: %d", error);
+            check(!error, "CDSP overlay failed");
+            trace("VPP CDSP overlay %dx%d -> %ux%u DSP=%llu us", params[i - 1].w, params[i - 1].h,
+                  target->width, target->height, (unsigned long long)us);
+        }
+#endif
+        base = target;
+    }
+    target->status = VA_STATUS_SUCCESS;
+}
+
 #else
 struct Vpp::Impl {};
 Vpp::Vpp(int) {
@@ -376,7 +574,7 @@ Vpp::Vpp(int) {
 bool Vpp::tone_mapping_supported() {
     return false;
 }
-void Vpp::process(const VppPicture &, const std::shared_ptr<Surface> &) {
+void Vpp::process(const std::vector<VppPicture> &, const std::shared_ptr<Surface> &) {
     throw Error(VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT, "VPP was disabled at build time");
 }
 #endif
