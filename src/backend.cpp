@@ -702,7 +702,8 @@ API(
               VA_STATUS_ERROR_SURFACE_BUSY);
         s->status = VA_STATUS_SUCCESS;
         c->target = s;
-        c->vpp_picture = {};
+        c->vpp_pictures.clear();
+        c->vpp_failed = false;
         return VA_STATUS_SUCCESS;
     } if (!s->persistent_export) s->memory.reset();
     s->status = VA_STATUS_SUCCESS; s->decoder = c->decoder; c->target = s; c->picture = Picture{};
@@ -773,45 +774,61 @@ static std::shared_ptr<Buffer> processing_filter(Driver &driver, VAContextID id,
 API(
     render_picture, (VADriverContextP ctx, VAContextID id, VABufferID *ids, int count),
     auto c = context(d, id);
-    check(bool(c->target), "no open picture"); for (int i = 0; i < count; ++i) {
-        auto b = buffer(d, ids[i]);
+    check(bool(c->target), "no open picture"); try {
+        if (c->entrypoint == VAEntrypointVideoProc)
+            check(!c->vpp_failed && count >= 0 && (!count || ids), "invalid VPP submission",
+                  VA_STATUS_ERROR_INVALID_PARAMETER);
+        for (int i = 0; i < count; ++i) {
+            auto b = buffer(d, ids[i]);
+            if (c->entrypoint == VAEntrypointVideoProc) {
+                check(b->context_id == id && b->type == VAProcPipelineParameterBufferType &&
+                          b->element_size >= sizeof(VAProcPipelineParameterBuffer) &&
+                          b->elements == 1,
+                      "invalid VPP pipeline buffer", VA_STATUS_ERROR_INVALID_BUFFER);
+                check(c->vpp_pictures.size() < 16, "VPP supports at most 16 layers",
+                      VA_STATUS_ERROR_UNIMPLEMENTED);
+                VAProcPipelineParameterBuffer params{};
+                std::memcpy(&params, b->data.data(), sizeof(params));
+                auto source = surface(d, params.surface);
+                auto filter = processing_filter(d, id, params.filters, params.num_filters);
+                c->vpp_pictures.push_back(
+                    vpp_picture(*b, source, *c->target, filter.get(), !c->vpp_pictures.empty()));
+            } else if (c->entrypoint == VAEntrypointEncSlice) {
+                check(b->context_id == id, "encode buffer belongs to another context",
+                      VA_STATUS_ERROR_INVALID_BUFFER);
+                render_encode_buffer(c->encode_settings, c->encode_picture, *b);
+            } else if (is_vp9(c->profile))
+                render_buffer(c->vp9_picture, b);
+            else if (is_hevc(c->profile))
+                render_buffer(c->hevc_picture, b);
+            else
+                render_buffer(c->picture, b);
+        }
+    } catch (...) {
         if (c->entrypoint == VAEntrypointVideoProc) {
-            check(b->context_id == id && b->type == VAProcPipelineParameterBufferType &&
-                      b->element_size >= sizeof(VAProcPipelineParameterBuffer) && b->elements == 1,
-                  "invalid VPP pipeline buffer", VA_STATUS_ERROR_INVALID_BUFFER);
-            check(!c->vpp_picture.source, "VPP supports one source per picture",
-                  VA_STATUS_ERROR_UNIMPLEMENTED);
-            VAProcPipelineParameterBuffer params{};
-            std::memcpy(&params, b->data.data(), sizeof(params));
-            auto source = surface(d, params.surface);
-            auto filter = processing_filter(d, id, params.filters, params.num_filters);
-            c->vpp_picture = vpp_picture(*b, source, *c->target, filter.get());
-        } else if (c->entrypoint == VAEntrypointEncSlice) {
-            check(b->context_id == id, "encode buffer belongs to another context",
-                  VA_STATUS_ERROR_INVALID_BUFFER);
-            render_encode_buffer(c->encode_settings, c->encode_picture, *b);
-        } else if (is_vp9(c->profile))
-            render_buffer(c->vp9_picture, b);
-        else if (is_hevc(c->profile))
-            render_buffer(c->hevc_picture, b);
-        else
-            render_buffer(c->picture, b);
+            c->vpp_pictures.clear();
+            c->vpp_failed = true;
+        }
+        throw;
     } return VA_STATUS_SUCCESS;)
 API(
     end_picture, (VADriverContextP ctx, VAContextID id), auto c = context(d, id);
     check(bool(c->target), "no open picture"); auto target = c->target; c->target.reset();
     if (c->entrypoint == VAEntrypointVideoProc) {
-        auto picture = std::move(c->vpp_picture);
-        c->vpp_picture = {};
-        check(bool(picture.source), "VPP pipeline parameters missing",
+        auto pictures = std::move(c->vpp_pictures);
+        c->vpp_pictures.clear();
+        check(!c->vpp_failed && !pictures.empty(), "VPP pipeline parameters missing or rejected",
               VA_STATUS_ERROR_INVALID_PARAMETER);
-        synchronize(d, picture.source);
+        for (const auto &picture : pictures) {
+            synchronize(d, picture.source);
+            check(!picture.source->mapped_images && !picture.source->acquired_handles,
+                  "VPP source is in use", VA_STATUS_ERROR_SURFACE_BUSY);
+        }
         synchronize(d, target);
-        check(!picture.source->mapped_images && !picture.source->acquired_handles &&
-                  !target->derived_images && !target->acquired_handles,
-              "VPP surface is in use", VA_STATUS_ERROR_SURFACE_BUSY);
+        check(!target->derived_images && !target->acquired_handles, "VPP surface is in use",
+              VA_STATUS_ERROR_SURFACE_BUSY);
         try {
-            c->vpp->process(picture, target);
+            c->vpp->process(pictures, target);
         } catch (const Error &e) {
             target->status = e.status;
             throw;

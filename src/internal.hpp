@@ -244,7 +244,10 @@ void vpp_caps(VAProcPipelineCaps &caps, bool tone_mapping = false);
 void vpp_filter(const Buffer &buffer);
 struct VppPicture {
     std::shared_ptr<Surface> source;
-    VARectangle region{};
+    VARectangle region{}, output{};
+    VABlendState blend{};
+    VAProcColorStandardType color_standard = VAProcColorStandardNone;
+    VAProcColorProperties color_properties{};
     unsigned rotation = VA_ROTATION_NONE;
     bool tone_mapping = false;
     float source_peak = 1000.0f;
@@ -257,10 +260,14 @@ class Vpp {
     explicit Vpp(int render_fd);
     ~Vpp();
     bool tone_mapping_supported();
-    void process(const VppPicture &picture, const std::shared_ptr<Surface> &target);
+    void process(const std::vector<VppPicture> &pictures, const std::shared_ptr<Surface> &target);
+
+  private:
+    bool vulkan_available();
+    void process_single(const VppPicture &picture, const std::shared_ptr<Surface> &target);
 };
 VppPicture vpp_picture(const Buffer &buffer, const std::shared_ptr<Surface> &source,
-                       const Surface &target, const Buffer *filter);
+                       const Surface &target, const Buffer *filter, bool overlay);
 struct Context {
     VAProfile profile;
     VAProfile internal_profile;
@@ -270,7 +277,8 @@ struct Context {
     std::shared_ptr<Decoder> decoder;
     std::shared_ptr<Encoder> encoder;
     std::unique_ptr<Vpp> vpp;
-    VppPicture vpp_picture;
+    std::vector<VppPicture> vpp_pictures;
+    bool vpp_failed = false;
     EncodeSettings encode_settings;
     EncodePicture encode_picture;
     std::shared_ptr<Surface> target;

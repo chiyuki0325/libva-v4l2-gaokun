@@ -251,8 +251,8 @@ static void run_case(Case c) {
             "available VPP filters");
     VAProcPipelineCaps caps{};
     va(vaQueryVideoProcPipelineCaps(display, context, nullptr, 0, &caps));
-    require(caps.num_input_pixel_formats == 2 && caps.num_output_pixel_formats == 2,
-            "NV12/P010 capability count");
+    require(caps.num_input_pixel_formats == 4 && caps.num_output_pixel_formats == 2,
+            "VPP input/output format count");
     require(caps.input_pixel_format && caps.input_pixel_format[0] == VA_FOURCC_NV12 &&
                 caps.input_pixel_format[1] == VA_FOURCC_P010 &&
                 caps.output_pixel_format[1] == VA_FOURCC_P010,
