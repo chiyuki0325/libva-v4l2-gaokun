@@ -119,4 +119,16 @@ int HAP_power_set(void *, HAP_power_request_t *);
 int HAP_power_get(void *, HAP_power_response_t *);
 int HAP_power_destroy_client(void *);
 
+// Optional compute-resource ABI behind the SDK's HAP_compute_res wrappers.
+// Weak imports let older firmware load the skeleton without VTCM support.
+typedef struct {
+    unsigned long long attributes[20];
+} compute_res_attr_t;
+int compute_resource_attr_init(compute_res_attr_t *) __attribute__((weak));
+int compute_resource_attr_set_vtcm_param(compute_res_attr_t *, unsigned int, unsigned char)
+    __attribute__((weak));
+unsigned int compute_resource_acquire(compute_res_attr_t *, unsigned int) __attribute__((weak));
+void *compute_resource_attr_get_vtcm_ptr(compute_res_attr_t *) __attribute__((weak));
+int compute_resource_release(unsigned int) __attribute__((weak));
+
 #include "qurt_abi_checks.h"

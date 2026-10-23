@@ -36,8 +36,10 @@ For uninstalled builds, set `LD_LIBRARY_PATH` and `ADSP_LIBRARY_PATH` to
 - `dsp.c` / `filter.h`: Q7 area and Q14 cubic filters, cached per context.
   P010 operations retain signed Q4 intermediates; NV12 output rounds and
   saturates after filtering. Conversion preserves color range and matrix.
-  Rotation transposes pixel groups (keeping U/V paired); combined operations
-  use 16-row strips per worker instead of a full-frame intermediate.
+  Rotation transposes pixel groups (keeping U/V paired); 90°/270° HVX tiles
+  write 128-byte spans using 32–128 rows. Strips and transpose workspace
+  prefer VTCM, falling back to aligned memory when unavailable. Scratch is
+  sized for active workers and released when no longer needed or reconfigured.
   Active workers follow the HVX count (1–8); each context currently allocates
   eight DSP threads. Multiple contexts therefore share a finite thread budget.
   Contexts request maximum core/bus performance.

@@ -12,6 +12,17 @@ ABI_OFFSET(qurt_thread_attr_t, stack_size, 24);
 ABI_OFFSET(qurt_thread_attr_t, stack_addr, 28);
 ABI_OFFSET(qurt_thread_attr_t, detach_state, 32);
 ABI_SIZE(qurt_sem_t, 16, 8);
+ABI_SIZE(compute_res_attr_t, 160, 8);
+ABI_OFFSET(compute_res_attr_t, attributes, 0);
+#define ABI_FUNCTION(name, type)                                                                   \
+    _Static_assert(__builtin_types_compatible_p(__typeof__(&name), type), #name " ABI")
+ABI_FUNCTION(compute_resource_attr_init, int (*)(compute_res_attr_t *));
+ABI_FUNCTION(compute_resource_attr_set_vtcm_param,
+             int (*)(compute_res_attr_t *, unsigned int, unsigned char));
+ABI_FUNCTION(compute_resource_acquire, unsigned int (*)(compute_res_attr_t *, unsigned int));
+ABI_FUNCTION(compute_resource_attr_get_vtcm_ptr, void *(*)(compute_res_attr_t *));
+ABI_FUNCTION(compute_resource_release, int (*)(unsigned int));
+#undef ABI_FUNCTION
 ABI_SIZE(HAP_power_request_t, 120, 8);
 ABI_SIZE(HAP_power_response_t, 16, 8);
 ABI_OFFSET(HAP_power_request_t, apptype, 8);

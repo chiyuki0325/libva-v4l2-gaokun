@@ -19,6 +19,7 @@ with tempfile.TemporaryDirectory() as tmp:
 #include <qurt_sem.h>
 #include <qurt_hvx.h>
 #include <HAP_power.h>
+#include <HAP_compute_res.h>
 #include "qurt_abi_checks.h"
 _Static_assert(QURT_THREAD_ATTR_TCB_PARTITION_DEFAULT == 0 &&
                QURT_THREAD_ATTR_STID_DEFAULT == 0 && QURT_THREAD_DEFAULT_GROUP_ID == 0 &&
@@ -31,4 +32,4 @@ _Static_assert(QURT_THREAD_ATTR_TCB_PARTITION_DEFAULT == 0 &&
                         '-I' + str(sdk / 'incs'), '-I' + str(sdk / 'incs/stddef'),
                         '-I' + str(sdk / ('rtos/qurt/compute' + arch) / 'include/qurt'),
                         '-I' + str(root / 'src/cdsp'), str(source)], check=True)
-        print(f'PASS: {arch} thread, semaphore, power layouts and constants match SDK 6.7', flush=True)
+        print(f'PASS: {arch} thread, semaphore, power and compute-resource ABI match SDK 6.7', flush=True)

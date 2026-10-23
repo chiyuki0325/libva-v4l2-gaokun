@@ -36,7 +36,57 @@ typedef struct {
     int16_t weights[FILTER_MAX_TAPS][64];
     int src_base, dst_offset, components, tap_count, spans_two_vectors;
 } __attribute__((aligned(128))) WideTile;
-#define ROTATION_ROWS 16
+#define ROTATION_MAX_ROWS 128
+#define TRANSPOSE_WORKER_BYTES (2 * ROTATION_MAX_ROWS * 128)
+
+typedef struct {
+    uint8_t *data;
+    unsigned bytes, vtcm_context;
+} RotationBuffer;
+
+static void release_rotation_buffer(RotationBuffer *buffer) {
+    if (buffer->vtcm_context) {
+        qurt_mem_syncht();
+        compute_resource_release(buffer->vtcm_context);
+    } else
+        free(buffer->data);
+    memset(buffer, 0, sizeof(*buffer));
+}
+
+static int resize_rotation_buffer(RotationBuffer *buffer, unsigned bytes, int use_vtcm) {
+    if (buffer->bytes == bytes && (!buffer->vtcm_context || use_vtcm))
+        return 0;
+    // Workers are idle here. Release old storage before requesting scarce VTCM.
+    release_rotation_buffer(buffer);
+    if (!bytes)
+        return 0;
+    if (use_vtcm && compute_resource_attr_init && compute_resource_attr_set_vtcm_param &&
+        compute_resource_acquire && compute_resource_attr_get_vtcm_ptr &&
+        compute_resource_release) {
+        compute_res_attr_t attr;
+        if (!compute_resource_attr_init(&attr) &&
+            !compute_resource_attr_set_vtcm_param(&attr, bytes, 0)) {
+            // Never wait for other clients or request exclusive access to the DSP.
+            unsigned context = compute_resource_acquire(&attr, 0);
+            if (context) {
+                uint8_t *data = compute_resource_attr_get_vtcm_ptr(&attr);
+                if (data && !((uintptr_t)data & 127)) {
+                    buffer->data = data;
+                    buffer->vtcm_context = context;
+                } else
+                    compute_resource_release(context);
+            }
+        }
+    }
+    // Missing firmware APIs and exhausted VTCM both use ordinary aligned memory.
+    // Retain that choice until the layout changes, instead of retrying every frame.
+    if (!buffer->data)
+        buffer->data = memalign(128, bytes);
+    if (!buffer->data)
+        return AEE_ENOMEMORY;
+    buffer->bytes = bytes;
+    return 0;
+}
 
 typedef struct ScalerState ScalerState;
 typedef struct {
@@ -59,8 +109,8 @@ struct ScalerState {
     int16_t *cubic_rows, *wide_rows;
     WideTile *wide_tiles[2];
     int wide_tile_count[2], src_format, dst_format;
-    uint8_t *rotation_rows;
-    int rotation, rotation_stride;
+    RotationBuffer rotation_rows, transpose_workspace;
+    int rotation, rotation_stride, rotation_worker_rows;
     Worker workers[CDSP_VPP_MAX_WORKERS]; // Spare workers stay asleep.
     int created_workers, stop;
     const uint8_t *src;
@@ -146,8 +196,8 @@ static void clear_filters(ScalerState *state) {
         state->area_tiles[plane_index] = 0;
         state->horizontal_filters[plane_index] = state->vertical_filters[plane_index] = 0;
     }
-    free(state->rotation_rows);
-    state->rotation_rows = 0;
+    release_rotation_buffer(&state->rotation_rows);
+    release_rotation_buffer(&state->transpose_workspace);
     state->rotation_stride = 0;
     free(state->wide_rows);
     state->wide_rows = 0;
@@ -1218,12 +1268,13 @@ static void reverse_row(const uint8_t *src, uint8_t *dst, int pixels, int pixel_
     for (; x < bytes; x += pixel_bytes)
         memcpy(dst + x, src + bytes - x - pixel_bytes, pixel_bytes);
 }
-// Transpose 16 rows at a time. Each butterfly stage interleaves increasingly
-// large pixel groups. The resulting vectors contain consecutive columns,
-// each with 16 pixels; U/V and the two bytes of P010 stay together throughout.
-static void rotate_strip(const uint8_t *src, int src_stride, uint8_t *dst, int dst_stride,
-                         int width, int height, int first_row, int rows, int pixel_bytes,
-                         int rotation, int hvx) {
+// A square tile has 128 / pixel_bytes rows and columns. Butterfly stages
+// transpose whole pixels (including U/V pairs), so each complete output row
+// becomes one 128-byte store. The two work arrays live outside the worker stack.
+static void rotate_strip(const uint8_t *restrict src, int src_stride, uint8_t *restrict dst,
+                         int dst_stride, int width, int height, int first_row, int rows,
+                         int pixel_bytes, int rotation, int hvx, uint8_t *restrict workspace,
+                         int tile_rows) {
     if (rotation == CDSP_VPP_ROTATE_180) {
         for (int y = 0; y < rows; y++)
             reverse_row(src + y * src_stride, dst + (height - first_row - y - 1) * dst_stride,
@@ -1233,11 +1284,11 @@ static void rotate_strip(const uint8_t *src, int src_stride, uint8_t *dst, int d
     int clockwise = rotation == CDSP_VPP_ROTATE_90;
     int column = clockwise ? height - first_row - rows : first_row;
     if (hvx) {
-        HVX_Vector buffers[2][ROTATION_ROWS];
+        HVX_Vector(*buffers)[ROTATION_MAX_ROWS] = (HVX_Vector(*)[ROTATION_MAX_ROWS])workspace;
         int columns = 128 / pixel_bytes;
         for (int x = 0; x < width; x += columns) {
             int count = width - x < columns ? width - x : columns;
-            for (int y = 0; y < ROTATION_ROWS; y++) {
+            for (int y = 0; y < tile_rows; y++) {
                 buffers[0][y] = Q6_V_vzero();
                 if (y < rows) {
                     const uint8_t *line =
@@ -1248,9 +1299,10 @@ static void rotate_strip(const uint8_t *src, int src_stride, uint8_t *dst, int d
                         memcpy(&buffers[0][y], line, count * pixel_bytes);
                 }
             }
-            for (int stage = 0, group = 1; group < ROTATION_ROWS; stage++, group *= 2) {
+            int stage = 0;
+            for (int group = 1; group < tile_rows; stage++, group *= 2) {
                 HVX_Vector *in = buffers[stage & 1], *out = buffers[(stage + 1) & 1];
-                for (int base = 0; base < ROTATION_ROWS; base += 2 * group)
+                for (int base = 0; base < tile_rows; base += 2 * group)
                     for (int i = 0; i < group; i++) {
                         HVX_VectorPair pair = Q6_W_vshuff_VVR(in[base + i + group], in[base + i],
                                                               -pixel_bytes * group);
@@ -1258,14 +1310,15 @@ static void rotate_strip(const uint8_t *src, int src_stride, uint8_t *dst, int d
                         out[base + 2 * i + 1] = Q6_V_hi_W(pair);
                     }
             }
-            const uint8_t *transposed = (const uint8_t *)buffers[0];
+            const uint8_t *transposed = (const uint8_t *)buffers[stage & 1];
             for (int i = 0; i < count; i++) {
                 int output_row = clockwise ? x + i : width - x - i - 1;
                 uint8_t *target = dst + output_row * dst_stride + column * pixel_bytes;
-                int source_offset = i * ROTATION_ROWS * pixel_bytes;
-                HVX_Vector values = *(const HVX_Vector *)(transposed + (source_offset & ~127));
-                values = Q6_V_vror_VR(values, source_offset & 127);
-                store_partial_vector(target, values, rows * pixel_bytes);
+                HVX_Vector values = ((const HVX_Vector *)transposed)[i];
+                if (rows == tile_rows)
+                    *(UnalignedVector *)target = values;
+                else
+                    store_partial_vector(target, values, rows * pixel_bytes);
             }
         }
         return;
@@ -1291,15 +1344,16 @@ static void process_plane(ScalerState *state, const uint8_t *src, uint8_t *dst, 
     int pixel_bytes = channels * (state->dst_format == CDSP_VPP_P010 ? 2 : 1);
     int direct = state->src_format == state->dst_format && state->src_width == state->dst_width &&
                  state->src_height == state->dst_height;
-    int strips = (height + ROTATION_ROWS - 1) / ROTATION_ROWS;
+    int tile_rows = hvx && (state->rotation & 1) ? 128 / pixel_bytes : 16;
+    int strips = (height + tile_rows - 1) / tile_rows;
     for (int block = strips * worker / workers; block < strips * (worker + 1) / workers; block++) {
-        int first = block * ROTATION_ROWS;
-        int rows = height - first < ROTATION_ROWS ? height - first : ROTATION_ROWS;
+        int first = block * tile_rows;
+        int rows = height - first < tile_rows ? height - first : tile_rows;
         const uint8_t *input = src;
         int stride = src_stride;
         if (!direct) {
-            uint8_t *scratch =
-                state->rotation_rows + worker * ROTATION_ROWS * state->rotation_stride;
+            uint8_t *scratch = state->rotation_rows.data +
+                               worker * state->rotation_worker_rows * state->rotation_stride;
             stride = state->rotation_stride;
             process_rows(state, src, scratch, src_stride, stride, plane, hvx, worker, first,
                          first + rows);
@@ -1307,7 +1361,11 @@ static void process_plane(ScalerState *state, const uint8_t *src, uint8_t *dst, 
         } else
             input += first * src_stride;
         rotate_strip(input, stride, dst, dst_stride, state->dst_width / channels, height, first,
-                     rows, pixel_bytes, state->rotation, hvx);
+                     rows, pixel_bytes, state->rotation, hvx,
+                     hvx && (state->rotation & 1)
+                         ? state->transpose_workspace.data + worker * TRANSPOSE_WORKER_BYTES
+                         : 0,
+                     tile_rows);
     }
 }
 static void worker_main(void *opaque) {
@@ -1390,20 +1448,24 @@ int iris_vpp_transform(remote_handle64 h, const uint8_t *src, int src_size, uint
         if (e)
             return e;
     }
+    int transpose = worker_count && (rotation & 1);
+    int workers = worker_count ? worker_count : 1;
+    int e = resize_rotation_buffer(&state->transpose_workspace,
+                                   transpose ? workers * TRANSPOSE_WORKER_BYTES : 0, transpose);
+    if (e)
+        return e;
     // Conversion/scaling feeds bounded strips, never a second full frame.
     // Pure same-format rotation can read the mapped source directly.
-    if (rotation && (src_format != dst_format || state->src_width != state->dst_width ||
-                     state->src_height != state->dst_height)) {
-        int stride = (state->dst_width * dst_bytes + 127) & ~127;
-        if (stride > state->rotation_stride) {
-            uint8_t *rows = memalign(128, CDSP_VPP_MAX_WORKERS * ROTATION_ROWS * stride);
-            if (!rows)
-                return AEE_ENOMEMORY;
-            free(state->rotation_rows);
-            state->rotation_rows = rows;
-            state->rotation_stride = stride;
-        }
-    }
+    state->rotation_worker_rows = transpose ? 128 / dst_bytes : 16;
+    state->rotation_stride = (state->dst_width * dst_bytes + 127) & ~127;
+    int needs_strip =
+        rotation && (src_format != dst_format || state->src_width != state->dst_width ||
+                     state->src_height != state->dst_height);
+    unsigned strip_bytes =
+        needs_strip ? workers * state->rotation_worker_rows * state->rotation_stride : 0;
+    e = resize_rotation_buffer(&state->rotation_rows, strip_bytes, transpose);
+    if (e)
+        return e;
     uint64_t start_us = HAP_perf_get_time_us();
     if (state->profiling)
         memset(state->profile_us, 0, sizeof(state->profile_us));

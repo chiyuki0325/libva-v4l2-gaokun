@@ -84,7 +84,8 @@ export ADSP_LIBRARY_PATH="$PWD/build/src/cdsp${ADSP_LIBRARY_PATH:+;$ADSP_LIBRARY
 ```
 
 Checks NV12/P010 scaling, conversion and rotation, rounding, crop/output layouts,
-DMA-BUF identity, persistent mapping and context/buffer lifetime. Also run
+DMA-BUF identity, persistent mapping, context/buffer lifetime and rotation with
+five live contexts sharing scratch resources. Also run
 against a `-Dfastrpc=bundled` build.
 
 Optional ABI audit against SDK 6.7 (all six architectures):

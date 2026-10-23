@@ -492,6 +492,49 @@ static void check_buffer_lifetime() {
     puts("PASS: buffer lifetime, changing pixels, padding, duplicate imports and profiling");
 }
 
+// Keep enough wide rotation strips alive to exceed the test board's VTCM.
+// Every context must remain usable when subsequent allocations fall back to DDR.
+static void check_rotation_contexts() {
+    constexpr size_t source_size = 1920 * 64 * 3 / 2, dest_size = 256 * 3840 * 3 / 2;
+    auto *source = import_test_buffer(source_size), *target = import_test_buffer(dest_size);
+    cdsp_vpp_frame src{source, 1920, 64, 1920, 0, 1920 * 64};
+    cdsp_vpp_frame dst{target, 128, 3840, 256, 0, 256 * 3840};
+    cdsp_vpp_context *contexts[5]{};
+    for (auto &ctx : contexts)
+        require(!cdsp_vpp_create(&ctx, CDSP_VPP_MAX_WORKERS, 1), "rotation context create");
+    for (int pass = 0; pass < 2; pass++) {
+        int value = 64 + pass * 32;
+        auto input = pixels(src, source_size, value);
+        sync(cdsp_vpp_buffer_fd(source), DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
+        memcpy(cdsp_vpp_buffer_map(source), input.data(), source_size);
+        sync(cdsp_vpp_buffer_fd(source), DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+        for (auto *ctx : contexts) {
+            if (!ctx)
+                continue;
+            uint64_t us;
+            require(!cdsp_vpp_transform(ctx, &src, CDSP_VPP_NV12, nullptr, &dst, CDSP_VPP_P010,
+                                        CDSP_VPP_ROTATE_90, &us),
+                    "rotation with multiple live contexts");
+            sync(cdsp_vpp_buffer_fd(target), DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+            auto *out = static_cast<const uint16_t *>(cdsp_vpp_buffer_map(target));
+            for (unsigned y = 0; y < dst.height * 3 / 2; y++)
+                for (unsigned x = 0; x < dst.width; x++) {
+                    unsigned expected = y < dst.height ? value : (x & 1) ? 255 - value : value / 2;
+                    require(out[y * dst.width + x] == expected * 256, "rotation context pixels");
+                }
+            sync(cdsp_vpp_buffer_fd(target), DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+        }
+        // Releasing one context must not invalidate any surviving workspace.
+        cdsp_vpp_destroy(contexts[0]);
+        contexts[0] = nullptr;
+    }
+    for (auto *ctx : contexts)
+        cdsp_vpp_destroy(ctx);
+    cdsp_vpp_release(target);
+    cdsp_vpp_release(source);
+    puts("PASS: rotation scratch with five live contexts and surviving allocations");
+}
+
 static void check_transform_boundaries() {
     constexpr size_t size = 16384;
     auto *source = import_test_buffer(size), *target = import_test_buffer(size);
@@ -672,5 +715,6 @@ int main() {
     }
     check_buffer_lifetime();
     check_transform_boundaries();
+    check_rotation_contexts();
     std::puts("PASS");
 }
