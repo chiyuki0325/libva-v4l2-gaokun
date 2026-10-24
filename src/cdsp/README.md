@@ -7,9 +7,8 @@ See [supported inputs and usage](../../README.md).
 
 ## Build and runtime
 
-- Linux ARM64 build machine; GHC with `syb` (`ghc haskell-syb` on Arch,
-  `ghc libghc-syb-dev` on Debian). No full Hexagon SDK required.
-- Meson downloads pinned QAIC and Hexagon Open Access **19.0.02** archives.
+- Linux ARM64 build machine. No full Hexagon SDK, QAIC or Haskell tools required.
+- Meson downloads the pinned Hexagon Open Access **19.0.02** archive.
   The toolchain is about 855 MiB compressed and needs several GiB extracted.
 - FastRPC defaults to the system library, falling back to pinned source.
   The fallback needs libyaml/libbsd development files. Use `-Dfastrpc=system`
@@ -33,6 +32,15 @@ For uninstalled builds, set `LD_LIBRARY_PATH` and `ADSP_LIBRARY_PATH` to
 
 ## Maintenance
 
+- `iris_vpp.h`, `iris_vpp_stub.c`, `iris_vpp_skel.c`: project-specific C RPC
+  bindings. `iris_vpp.idl` documents the original QAIC 1.00.51 wire ABI; it is
+  not a build input. Keep it and the bindings in sync when extending the API.
+  Method IDs 0/1 are loader open/close; IDs 2–9 are power, configure, run,
+  info, profile, process, transform and overlay. Append new methods, never
+  renumber existing ones. `iris_vpp_rpc.h` describes scalar widths and sequence
+  lengths. Preserve both input/output slots for `inrout` buffers and the
+  loader's handle slots. `build-dsp.py` sets each skeleton's URI at compile time.
+  Run the host RPC wire tests and the hardware tests below after changes.
 - `dsp.c` / `filter.h`: Q7 area and Q14 cubic filters, cached per context.
   P010 operations retain signed Q4 intermediates; NV12 output rounds and
   saturates after filtering. Conversion preserves color range and matrix.

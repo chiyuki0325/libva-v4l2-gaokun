@@ -32,7 +32,7 @@ if not cdsp_option.disabled()
     error('cdsp_vpp requires a Linux ARM64 build machine (Open Access 19.0.02)')
   endif
   if supported_build
-    have_cdsp_vpp = find_program('ghc', native: true, required: cdsp_option).found()
+    have_cdsp_vpp = true
   endif
 endif
 if have_cdsp_vpp
@@ -97,6 +97,8 @@ if formatter.found()
                    'src/overlay-params.h', 'src/cdsp/overlay.h',
                    'src/cdsp/qurt_abi.h', 'src/cdsp/qurt_abi_checks.h',
                    'src/cdsp/skel.cpp', 'src/cdsp/skel.h', 'src/cdsp/vpp_limits.h')
+  sources += files('src/cdsp/iris_vpp.h', 'src/cdsp/iris_vpp_rpc.h',
+                   'src/cdsp/iris_vpp_stub.c', 'src/cdsp/iris_vpp_skel.c')
   sources += files('src/vulkan/vpp.cpp', 'src/vulkan/vpp.hpp')
   run_target('format', command: [formatter, '-i', '--style=file', sources, headers])
   run_target('format-check', command: [formatter, '--dry-run', '--Werror', '--style=file', sources, headers])

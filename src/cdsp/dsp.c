@@ -2,6 +2,7 @@
 #include "filter.h"
 #include "../overlay-params.h"
 #include "iris_vpp.h"
+#include <AEEStdErr.h>
 #include "qurt_abi.h"
 #include "vpp_limits.h"
 #include <hexagon_protos.h>

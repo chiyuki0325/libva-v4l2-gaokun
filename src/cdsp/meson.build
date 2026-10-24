@@ -4,9 +4,6 @@ if build_machine.system() != 'linux' or build_machine.cpu_family() != 'aarch64'
   error('cdsp_vpp requires a Linux ARM64 build machine (Open Access 19.0.02)')
 endif
 python = import('python').find_installation()
-qaic_project = subproject('qaic')
-qaic = qaic_project.get_variable('qaic')
-qaic_idl_dir = qaic_project.get_variable('qaic_idl_dir')
 hexagon = subproject('hexagon').get_variable('hexagon_tools')
 
 cc = meson.get_compiler('c')
@@ -45,34 +42,36 @@ else
   summary('FastRPC', 'system')
 endif
 
-rpc_generated = custom_target('iris-vpp-rpc',
-  input: 'iris_vpp.idl',
-  output: ['iris_vpp.h', 'iris_vpp_stub.c', 'iris_vpp_skel.c'],
-  command: [qaic, '-mdll', '-st', '-I', qaic_idl_dir, '-o', '@OUTDIR@', '@INPUT@'])
 foreach arch : ['v68', 'v69', 'v73', 'v75', 'v79', 'v81']
   custom_target('iris-vpp-dsp-' + arch,
-    input: rpc_generated,
     output: 'vpp_' + arch + '_skel.so',
     command: [python, files('build-dsp.py'), arch, hexagon, fastrpc_include_dir,
-              meson.current_build_dir(), meson.current_source_dir(), '@OUTPUT@'],
-    depend_files: files('dsp.c', 'overlay.h', '../overlay-params.h', 'filter.h', 'qurt_abi.h', 'qurt_abi_checks.h', 'vpp_limits.h'),
+              meson.current_source_dir(), '@OUTPUT@'],
+    depend_files: files('iris_vpp.h', 'iris_vpp_rpc.h', 'iris_vpp_skel.c',
+                       'dsp.c', 'overlay.h', '../overlay-params.h', 'filter.h',
+                       'qurt_abi.h', 'qurt_abi_checks.h', 'vpp_limits.h'),
     build_by_default: true, install: true, install_dir: get_option('cdsp_firmware_dir'))
 endforeach
 skel_args = ['-DIRIS_VPP_DSP_DIR="' + (get_option('prefix') / get_option('cdsp_firmware_dir')) + '"']
 
 # Keep FastRPC out of the VA driver's DT_NEEDED list: decoding and encoding
 # remain available when the optional VPP runtime cannot be loaded.
-vpp_client = shared_library('iris_vpp', 'client.cpp', 'skel.cpp', rpc_generated[0], rpc_generated[1],
+vpp_client = shared_library('iris_vpp', 'client.cpp', 'skel.cpp', 'iris_vpp_stub.c',
   dependencies: [fastrpc_dep, threads],
-  c_args: ['-DSTATIC_LIB', '-Wno-unused-parameter', '-Wno-type-limits'],
   cpp_args: skel_args,
   install: true, install_dir: get_option('libdir') / 'libva-v4l2',
   install_rpath: '$ORIGIN')
 
 # Mock only the FastRPC boundary; exercise the production selector without a DSP.
 skel_test = executable('vpp-skel-selection', '../../tests/vpp/skel-selection.cpp',
-  'skel.cpp', rpc_generated[0],
+  'skel.cpp',
   dependencies: fastrpc_dep.partial_dependency(includes: true),
   include_directories: include_directories('.'),
   cpp_args: skel_args, build_by_default: false)
 test('CDSP skeleton selection', skel_test)
+
+rpc_test = executable('vpp-rpc', '../../tests/vpp/rpc.c', '../../tests/vpp/rpc-skel.c',
+  'iris_vpp_stub.c',
+  dependencies: fastrpc_dep.partial_dependency(includes: true),
+  include_directories: include_directories('.'), build_by_default: false)
+test('CDSP RPC wire ABI', rpc_test)

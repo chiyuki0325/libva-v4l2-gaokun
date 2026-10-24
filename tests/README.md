@@ -69,8 +69,11 @@ DMA-BUF zero-copy remains usable.
 
 ## CDSP VPP
 
-`meson test -C build --print-errorlogs` checks skeleton selection and HVX
-worker limits without DSP hardware. Build with CDSP enabled, then run on the
+`meson test -C build --print-errorlogs` checks skeleton selection, HVX
+worker limits and the C RPC bindings without DSP hardware. The RPC test covers
+all ten methods against fixed wire fixtures, loader handle slots, 64-bit outputs,
+error propagation, aliased/separate `inrout` buffers and malformed messages.
+Build with CDSP enabled, then run on the
 target (upstream FastRPC kernel ABI):
 
 ```sh

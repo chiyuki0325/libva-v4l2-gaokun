@@ -1,3 +1,5 @@
+// Protocol reference only; the build uses the handwritten C bindings.
+// Preserve method order and update iris_vpp.h, iris_vpp_stub.c and iris_vpp_skel.c together.
 #include "remote.idl"
 interface iris_vpp : remote_handle64 {
   long power(rout long mask);

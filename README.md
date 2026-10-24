@@ -53,8 +53,7 @@ depends on content and pipeline.
   output, larger CAPTURE pools, encoder deblocking controls, and error timestamps.
 - C++17 compiler, Meson ≥ 0.61, Ninja, pkg-config, libva ≥ 1.10 and libdrm
   development libraries. GPU-copy also requires EGL, GLES 3.2, and GBM.
-- CDSP VPP is enabled by default and requires a Linux ARM64 build machine,
-  GHC and `syb`.
+- CDSP VPP is enabled by default and requires a Linux ARM64 build machine.
   Use `-Dcdsp_vpp=disabled` to skip its dependencies and downloads.
 
 ## Build and install
@@ -90,8 +89,8 @@ vainfo --display drm --device /dev/dri/renderD128
 
 ## CDSP video processing
 
-Meson downloads pinned QAIC and Hexagon Open Access **19.0.02**, using system
-FastRPC or a source fallback. No full SDK is needed. Arch packaging enables CDSP;
+Meson downloads pinned Hexagon Open Access **19.0.02**, using system
+FastRPC or a source fallback. No full SDK needed. Arch packaging enables CDSP;
 Debian disables it. See [CDSP build and runtime requirements](src/cdsp/README.md).
 
 NV12/P010 scaling, conversion and clockwise 90°/180°/270° rotation can be

@@ -7,7 +7,7 @@ pkgdesc='VA-API backend for Qualcomm Iris stateful V4L2 M2M decoding and H.264/H
 arch=('aarch64')
 license=('MIT' 'GPL-2.0-only') # backend MIT; bundled Linux patch GPL-2.0-only
 depends=('glibc' 'gcc-libs' 'libva' 'libdrm' 'mesa' 'libglvnd' 'qcom-fastrpc' 'vulkan-icd-loader' 'vulkan-freedreno')
-makedepends=('meson' 'ninja' 'ghc' 'haskell-syb' 'vulkan-headers' 'glslang')
+makedepends=('meson' 'ninja' 'vulkan-headers' 'glslang')
 # Native strip cannot process the Hexagon DSP skeleton.
 options=('!strip')
 source=("$pkgname-$pkgver.tar.gz")
@@ -17,7 +17,7 @@ sha256sums=('SKIP')
 prepare() {
   # Fetch required build tools here so build() can run with nodownload.
   # FastRPC is supplied by qcom-fastrpc, not the fallback subproject.
-  meson subprojects download --sourcedir="$srcdir/$pkgname-$pkgver" qaic hexagon
+  meson subprojects download --sourcedir="$srcdir/$pkgname-$pkgver" hexagon
 }
 
 build() {
