@@ -80,6 +80,12 @@ sudo meson install -C build
 - `-Dfastcv=disabled` (default): omit VPP; `auto` enables it when dependencies
   are available, `enabled` requires them. Missing runtime libraries disable
   only VPP. Debian/Ubuntu packages disable FastCV.
+- `-Dgen1_decode_only=true`: for HFI Gen1 systems such as Gaokun3, advertise
+  only H.264 8-bit, HEVC Main and VP9 Profile 0 decoding. Encoding and unvalidated
+  10-bit profiles remain unavailable. Composed-layer exports use stable backing
+  for consumers that cache DMA-BUFs by `VASurfaceID`; separate-layer exports
+  retain the zero-copy Iris CAPTURE path. The option is disabled by default so
+  HFI Gen2 builds retain their existing capabilities.
 
 Adjust `libdir` if drivers belong somewhere other than `/usr/lib/dri`.
 The installed MSM alias selects this backend automatically on the target platform.
@@ -134,6 +140,9 @@ ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 \
 
 Use clang-format 22 with the checked-in `.clang-format` (Meson targets: `format`,
 `format-check`). Hardware test instructions are in [tests/](tests/).
+
+Gaokun3 HFI Gen1 的仅解码适配范围和分阶段计划见
+[docs/gaokun-gen1-decoder-port.md](docs/gaokun-gen1-decoder-port.md)。
 
 ## License
 

@@ -7,6 +7,7 @@ also require `ffprobe` and software H.264/HEVC decoding.
 | Test | Coverage |
 | --- | --- |
 | `decoder/main10.cpp` | Main10 8/10-bit capability probing, config validation, surface enumeration, and context bit-depth selection. |
+| `decoder/gen1-capabilities.cpp` | Gen1 decode-only profile/entrypoint restrictions and the 28-render-target limit. |
 | `decoder/prime-import.cpp` | PRIME1/PRIME2 NV12/P010 imports, malformed descriptors, shared storage, and caller FD ownership. |
 | `decoder/error-recovery.py` | Corrupt HEVC, queue errors, neutral NV12/P010 pixels, B frames, consecutive errors, DRM mapping, and persistent/imported storage. |
 | `encoder/ffmpeg-smoke.py` | Profiles, rate control, dimensions, frame counts, keyframes, and decoded quality. |

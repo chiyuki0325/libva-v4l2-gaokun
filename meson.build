@@ -56,6 +56,12 @@ if have_fastcv
 endif
 summary('FastCV CDSP VPP', have_fastcv)
 
+gen1_decode_only = get_option('gen1_decode_only')
+if gen1_decode_only
+  add_project_arguments('-DIRIS_GEN1_DECODE_ONLY=1', language: 'cpp')
+endif
+summary('HFI Gen1 decode-only', gen1_decode_only)
+
 sources = files(
   'src/backend.cpp',
   'src/decoder.cpp',

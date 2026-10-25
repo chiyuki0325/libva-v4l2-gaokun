@@ -38,6 +38,14 @@ struct QueueBuffer {
 bool expired(std::chrono::steady_clock::time_point start) {
     return std::chrono::steady_clock::now() - start > std::chrono::seconds(5);
 }
+unsigned capture_pool_size(unsigned surfaces) {
+#ifdef IRIS_GEN1_DECODE_ONLY
+    (void)surfaces;
+    return 32;
+#else
+    return std::min(64u, std::max(32u, surfaces + 4));
+#endif
+}
 } // namespace
 Memory::~Memory() {
     fastcv_registration.reset();
@@ -94,7 +102,7 @@ std::string find_device() {
 Decoder::Decoder(const std::string &device, unsigned width, unsigned height, unsigned surfaces,
                  VAProfile profile, unsigned rt_format, int render_fd)
     : render_fd_(render_fd), width_(width), height_(height),
-      pool_size_(std::min(64u, std::max(32u, surfaces + 4))),
+      pool_size_(capture_pool_size(surfaces)),
       fourcc_((is_10bit(profile) && (rt_format == VA_RT_FORMAT_YUV420_10)) ? VA_FOURCC_P010
                                                                            : VA_FOURCC_NV12),
       copier_(render_fd) {

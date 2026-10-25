@@ -1,0 +1,124 @@
+From cb977e83ea4f39cd6ddfad6b1b657060c8f33594 Mon Sep 17 00:00:00 2001
+From: Kirikaze Chiyuki <me@chyk.ink>
+Date: Sun, 25 Oct 2026 11:11:16 +0800
+Subject: [PATCH] media: iris: support decode-order output on HFI gen1
+
+Signed-off-by: Kirikaze Chiyuki <me@chyk.ink>
+---
+ .../media/platform/qcom/iris/iris_hfi_gen1.c  | 17 +++++++++++
+ .../qcom/iris/iris_hfi_gen1_command.c         | 28 +++++++++++++++++++
+ .../qcom/iris/iris_hfi_gen1_defines.h         |  4 +++
+ 3 files changed, 49 insertions(+)
+
+diff --git a/drivers/media/platform/qcom/iris/iris_hfi_gen1.c b/drivers/media/platform/qcom/iris/iris_hfi_gen1.c
+index d34f61d344f8..8c5838701039 100644
+--- a/drivers/media/platform/qcom/iris/iris_hfi_gen1.c
++++ b/drivers/media/platform/qcom/iris/iris_hfi_gen1.c
+@@ -30,6 +30,22 @@ static struct platform_inst_fw_cap inst_fw_cap_sm8250_dec[] = {
+ 		.hfi_id = HFI_PROPERTY_PARAM_WORK_MODE,
+ 		.set = iris_set_stage,
+ 	},
++	{
++		.cap_id = DISPLAY_DELAY_ENABLE,
++		.min = 0,
++		.max = 1,
++		.step_or_mask = 1,
++		.value = 0,
++		.hfi_id = HFI_PROPERTY_PARAM_VDEC_OUTPUT_ORDER,
++		.flags = CAP_FLAG_INPUT_PORT,
++	},
++	{
++		.cap_id = DISPLAY_DELAY,
++		.min = 0,
++		.max = 0,
++		.step_or_mask = 1,
++		.value = 0,
++	},
+ };
+ 
+ static const struct platform_inst_fw_cap inst_fw_cap_sm8250_enc[] = {
+@@ -232,6 +248,7 @@ static const struct platform_inst_fw_cap inst_fw_cap_sm8250_enc[] = {
+ };
+ 
+ static const u32 sm8250_vdec_input_config_param_default[] = {
++	HFI_PROPERTY_PARAM_VDEC_OUTPUT_ORDER,
+ 	HFI_PROPERTY_CONFIG_VIDEOCORES_USAGE,
+ 	HFI_PROPERTY_PARAM_UNCOMPRESSED_FORMAT_SELECT,
+ 	HFI_PROPERTY_PARAM_UNCOMPRESSED_PLANE_ACTUAL_CONSTRAINTS_INFO,
+diff --git a/drivers/media/platform/qcom/iris/iris_hfi_gen1_command.c b/drivers/media/platform/qcom/iris/iris_hfi_gen1_command.c
+index 35633bd7e9b7..5f081c4f5247 100644
+--- a/drivers/media/platform/qcom/iris/iris_hfi_gen1_command.c
++++ b/drivers/media/platform/qcom/iris/iris_hfi_gen1_command.c
+@@ -576,6 +576,17 @@ iris_hfi_gen1_packet_session_set_property(struct hfi_session_set_property_pkt *p
+ 		packet->shdr.hdr.size += sizeof(u32) + sizeof(*multi);
+ 		break;
+ 	}
++	case HFI_PROPERTY_PARAM_VDEC_OUTPUT_ORDER: {
++		u32 *output_order = pdata;
++
++		if (*output_order != HFI_OUTPUT_ORDER_DISPLAY &&
++		    *output_order != HFI_OUTPUT_ORDER_DECODE)
++			return -EINVAL;
++
++		packet->data[1] = *output_order;
++		packet->shdr.hdr.size += sizeof(u32) * 2;
++		break;
++	}
+ 	case HFI_PROPERTY_PARAM_BUFFER_SIZE_ACTUAL: {
+ 		struct hfi_buffer_size_actual *in = pdata, *sz = prop_data;
+ 
+@@ -1011,6 +1022,21 @@ static int iris_hfi_gen1_set_stride(struct iris_inst *inst, u32 plane)
+ 	return hfi_gen1_set_property(inst, ptype, &plane_actual_info, sizeof(plane_actual_info));
+ }
+ 
++static int iris_hfi_gen1_set_decode_order_output(struct iris_inst *inst, u32 plane)
++{
++	struct platform_inst_fw_cap *cap = &inst->fw_caps[DISPLAY_DELAY_ENABLE];
++	u32 output_order;
++
++	if (!(cap->flags & CAP_FLAG_CLIENT_SET))
++		return 0;
++
++	output_order = cap->value ? HFI_OUTPUT_ORDER_DECODE :
++				    HFI_OUTPUT_ORDER_DISPLAY;
++
++	return hfi_gen1_set_property(inst, HFI_PROPERTY_PARAM_VDEC_OUTPUT_ORDER,
++				     &output_order, sizeof(output_order));
++}
++
+ static int iris_hfi_gen1_session_set_config_params(struct iris_inst *inst, u32 plane)
+ {
+ 	struct iris_hfi_prop_type_handle const *handler = NULL;
+@@ -1021,6 +1047,8 @@ static int iris_hfi_gen1_session_set_config_params(struct iris_inst *inst, u32 p
+ 	int ret;
+ 
+ 	static const struct iris_hfi_prop_type_handle vdec_prop_type_handle_inp_arr[] = {
++		{HFI_PROPERTY_PARAM_VDEC_OUTPUT_ORDER,
++			iris_hfi_gen1_set_decode_order_output},
+ 		{HFI_PROPERTY_PARAM_FRAME_SIZE,
+ 			iris_hfi_gen1_set_resolution},
+ 		{HFI_PROPERTY_CONFIG_VIDEOCORES_USAGE,
+diff --git a/drivers/media/platform/qcom/iris/iris_hfi_gen1_defines.h b/drivers/media/platform/qcom/iris/iris_hfi_gen1_defines.h
+index f5f0ea1c99cf..a5aad876aaba 100644
+--- a/drivers/media/platform/qcom/iris/iris_hfi_gen1_defines.h
++++ b/drivers/media/platform/qcom/iris/iris_hfi_gen1_defines.h
+@@ -69,6 +69,7 @@
+ #define HFI_PROPERTY_CONFIG_BUFFER_REQUIREMENTS		0x202001
+ 
+ #define HFI_PROPERTY_PARAM_VDEC_DPB_COUNTS		0x120300e
++#define HFI_PROPERTY_PARAM_VDEC_OUTPUT_ORDER		0x1203005
+ #define HFI_PROPERTY_CONFIG_VDEC_ENTROPY		0x1204004
+ 
+ #define HFI_BUFFER_INPUT				0x1
+@@ -98,6 +99,9 @@
+ #define HFI_PROPERTY_PARAM_VDEC_COLOUR_SPACE		0x100300a
+ #define HFI_CORE_ID_1					1
+ #define HFI_COLOR_FORMAT_NV12				0x02
++#define HFI_OUTPUT_ORDER_DISPLAY			0x1000001
++#define HFI_OUTPUT_ORDER_DECODE				0x1000002
++
+ #define HFI_COLOR_FORMAT_NV12_UBWC			0x8002
+ 
+ #define HFI_MSG_SYS_INIT				0x20001
+-- 
+2.39.5

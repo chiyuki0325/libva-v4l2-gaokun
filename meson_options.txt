@@ -1,2 +1,8 @@
 option('gpu_copy', type: 'feature', value: 'auto', description: 'Surface copying with EGL, GLES 3.2, and GBM')
 option('fastcv', type: 'feature', value: 'disabled', description: 'VA-API scaling with FastCV on CDSP')
+option(
+  'gen1_decode_only',
+  type: 'boolean',
+  value: false,
+  description: 'Restrict HFI Gen1 builds to validated 8-bit decode profiles',
+)

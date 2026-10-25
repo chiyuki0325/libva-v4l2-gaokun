@@ -87,13 +87,25 @@ template <class F> VAStatus guard(VADriverContextP ctx, F f) noexcept {
         return guard(ctx, [&](Driver &d) -> VAStatus { __VA_ARGS__ });                             \
     }
 static bool supported(VAProfile p) {
+#ifdef IRIS_GEN1_DECODE_ONLY
+    return p == VAProfileH264ConstrainedBaseline || p == VAProfileH264Main ||
+           p == VAProfileH264High || p == VAProfileHEVCMain || p == VAProfileVP9Profile0;
+#else
     return p == VAProfileH264ConstrainedBaseline || p == VAProfileH264Main ||
            p == VAProfileH264High || is_hevc(p) || is_vp9(p);
+#endif
 }
 static bool encode_supported(const Driver &d, VAProfile p, VAEntrypoint e) {
+#ifdef IRIS_GEN1_DECODE_ONLY
+    (void)d;
+    (void)p;
+    (void)e;
+    return false;
+#else
     return !d.encoder_device.empty() && e == VAEntrypointEncSlice &&
            (p == VAProfileH264ConstrainedBaseline || p == VAProfileH264Main ||
             p == VAProfileH264High || p == VAProfileHEVCMain);
+#endif
 }
 static unsigned encode_attribute(VAConfigAttribType type, VAProfile profile) {
     (void)profile; // HEVC attributes are only available in libva >= 1.13.
@@ -249,8 +261,13 @@ static std::shared_ptr<Memory> allocate_undecoded_surface(VADriverContextP ctx, 
 API(query_profiles, (VADriverContextP ctx, VAProfile *out, int *count), (void)d;
     check(out && count, "null profiles", VA_STATUS_ERROR_INVALID_PARAMETER);
     out[0] = VAProfileH264ConstrainedBaseline; out[1] = VAProfileH264Main;
-    out[2] = VAProfileH264High; out[3] = VAProfileHEVCMain; out[4] = VAProfileHEVCMain10;
-    out[5] = VAProfileVP9Profile0; out[6] = VAProfileVP9Profile2; *count = 7;
+    out[2] = VAProfileH264High; out[3] = VAProfileHEVCMain;
+#ifdef IRIS_GEN1_DECODE_ONLY
+    out[4] = VAProfileVP9Profile0; *count = 5;
+#else
+    out[4] = VAProfileHEVCMain10; out[5] = VAProfileVP9Profile0; out[6] = VAProfileVP9Profile2;
+    *count = 7;
+#endif
     if (vpp_supported(VAProfileNone, VAEntrypointVideoProc)) out[(*count)++] = VAProfileNone;
     return VA_STATUS_SUCCESS;)
 API(query_entrypoints, (VADriverContextP ctx, VAProfile profile, VAEntrypoint *out, int *count),
@@ -550,6 +567,11 @@ API(create_context,
     check(((processing && w >= 0 && h >= 0) || (w >= 128 && h >= 128)) && w <= 8192 && h <= 8192 &&
               result,
           "invalid context dimensions", VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED);
+#ifdef IRIS_GEN1_DECODE_ONLY
+    if (config.entrypoint == VAEntrypointVLD)
+        check(count <= 28, "HFI Gen1 supports at most 28 decode surfaces",
+              VA_STATUS_ERROR_MAX_NUM_EXCEEDED);
+#endif
     auto c = std::make_shared<Context>(); c->profile = config.profile;
     c->entrypoint = config.entrypoint; c->encode_settings.rate_control = config.rate_control;
     c->encode_settings.hevc = is_hevc(c->profile); if (c->entrypoint == VAEntrypointEncSlice)
@@ -970,7 +992,23 @@ API(
               s->memory->origin == MemoryOrigin::DmaHeap ||
               s->memory->origin == MemoryOrigin::Imported,
           "writable export requires independent storage", VA_STATUS_ERROR_UNIMPLEMENTED);
-    if (!s->memory) s->memory = allocate_undecoded_surface(ctx, *s); auto m = s->memory;
+    if (!s->memory) s->memory = allocate_undecoded_surface(ctx, *s);
+#ifdef IRIS_GEN1_DECODE_ONLY
+    // dmabuf-wayland caches a composed wl_buffer by VASurfaceID. Iris chooses
+    // CAPTURE buffers independently for each picture, so pin composed exports
+    // to stable storage. Separate-layer GPU importers re-export every frame
+    // and can keep using the decoder's CAPTURE DMA-BUF without a copy.
+    if (!s->persistent_export && s->token && (flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS)) {
+        auto decoded = s->memory;
+        auto stable = allocate_undecoded_surface(ctx, *s);
+        copy_surface(*stable, *decoded, s->width, s->height);
+        s->memory = stable;
+        s->persistent_export = true;
+        trace("surface=%#x switched to stable exported storage=%p", id,
+              static_cast<void *>(stable.get()));
+    }
+#endif
+    auto m = s->memory;
     auto &desc = *static_cast<VADRMPRIMESurfaceDescriptor *>(out); desc = {};
     desc.fourcc = m->fourcc; desc.width = s->width; desc.height = s->height; desc.num_objects = 1;
     desc.objects[0].fd = fcntl(m->fd, F_DUPFD_CLOEXEC, 0);
@@ -1034,17 +1072,28 @@ extern "C" VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
     try {
         auto d = std::make_unique<Driver>();
         d->device = find_device();
+#ifndef IRIS_GEN1_DECODE_ONLY
         d->encoder_device = find_encoder_device();
+#endif
         ctx->version_major = VA_MAJOR_VERSION;
         ctx->version_minor = VA_MINOR_VERSION;
+#ifdef IRIS_GEN1_DECODE_ONLY
+        ctx->max_profiles = 5;
+        ctx->max_entrypoints = 1;
+#else
         ctx->max_profiles = 8;
         ctx->max_entrypoints = 2;
+#endif
         ctx->max_attributes = 16;
         // libva validates nonzero allocation bounds even when queries return no entries.
         ctx->max_image_formats = 3;
         ctx->max_subpic_formats = 1;
         ctx->max_display_attributes = 1;
+#ifdef IRIS_GEN1_DECODE_ONLY
+        ctx->str_vendor = "Iris V4L2 stateful VA-API backend (HFI Gen1 decode-only)";
+#else
         ctx->str_vendor = "Iris V4L2 stateful VA-API backend";
+#endif
         auto &v = *ctx->vtable;
         if (ctx->vtable_vpp && vpp_supported(VAProfileNone, VAEntrypointVideoProc)) {
             auto &vpp = *ctx->vtable_vpp;
