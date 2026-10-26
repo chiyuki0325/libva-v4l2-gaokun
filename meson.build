@@ -74,6 +74,14 @@ sources = files(
   'src/vpp.cpp',
 )
 headers = files('src/internal.hpp')
+capture_pool_test = executable('capture-pool-test', 'tests/decoder/capture-pool.cpp',
+  dependencies: [va, drm, threads], cpp_args: ['-UNDEBUG', '-UIRIS_GEN1_DECODE_ONLY'],
+  build_by_default: false)
+test('Decoder CAPTURE memory budget', capture_pool_test)
+capture_pool_gen1_test = executable('capture-pool-gen1-test', 'tests/decoder/capture-pool.cpp',
+  dependencies: [va, drm, threads], cpp_args: ['-UNDEBUG', '-DIRIS_GEN1_DECODE_ONLY=1'],
+  build_by_default: false)
+test('Gen1 decoder CAPTURE memory budget', capture_pool_gen1_test)
 driver_install_dir = get_option('libdir') / 'dri'
 
 shared_library(

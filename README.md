@@ -82,7 +82,8 @@ sudo meson install -C build
   only VPP. Debian/Ubuntu packages disable FastCV.
 - `-Dgen1_decode_only=true`: for HFI Gen1 systems such as Gaokun3, advertise
   H.264 8-bit, HEVC Main/Main10 and VP9 Profile 0/2 decoding, with a 32-buffer
-  CAPTURE pool and at most 28 context render targets. Main10/Profile 2 require
+  CAPTURE pool limit and at most 28 context render targets. CAPTURE allocation
+  also respects a 768 MiB budget using the negotiated buffer size. Main10/Profile 2 require
   the Gen1 TP10 DPB/P010 output kernel patches; they are not yet hardware-validated
   on Gaokun3. Encoding remains unavailable. Composed-layer exports use stable backing
   for consumers that cache DMA-BUFs by `VASurfaceID`; separate-layer exports

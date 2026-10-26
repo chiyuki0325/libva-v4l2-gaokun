@@ -4,6 +4,10 @@ Run on the supported Iris board. These are hardware integration tests, not host
 unit tests. C/C++ files include build commands in their headers; FFmpeg tests
 also require `ffprobe` and software H.264/HEVC decoding.
 
+`meson test -C build` also checks CAPTURE buffer budgeting without hardware.
+The Gen1 variant checks the 32-buffer limit, including oversized allocation
+hints and firmware minima.
+
 | Test | Coverage |
 | --- | --- |
 | `decoder/main10.cpp` | Main10 8/10-bit capability probing, config validation, surface enumeration, and context bit-depth selection. |

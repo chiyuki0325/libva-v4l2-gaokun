@@ -29,7 +29,8 @@ meson setup build-gaokun-gen1 --buildtype=release \
 `gen1_decode_only` 不探测编码节点，公布 H.264 Constrained Baseline/Main/High、
 HEVC Main/Main10 和 VP9 Profile 0/2 的解码入口。Main10/Profile 2 必须搭配
 Gen1 TP10 DPB/P010 输出内核补丁；实现已开放，但尚未完成 Gaokun3 10-bit 实机验收。
-CAPTURE pool 初始固定为 32；带超过 28 个
+CAPTURE pool 默认目标为 32、上限为 32，并按协商后的单缓冲区大小受
+768 MiB 内存预算约束；带超过 28 个
 render target 的解码上下文会明确返回 `VA_STATUS_ERROR_MAX_NUM_EXCEEDED`，而不是
 向 Gen1 firmware 请求 33–64 个 buffer。该选项默认关闭，避免改变 Q8B HFI
 Gen2 的现有能力。
