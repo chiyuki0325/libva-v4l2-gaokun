@@ -86,6 +86,10 @@ capture_pool_gen1_test = executable('capture-pool-gen1-test', 'tests/decoder/cap
   dependencies: [va, drm, threads], cpp_args: ['-UNDEBUG', '-DIRIS_GEN1_DECODE_ONLY=1'],
   build_by_default: false)
 test('Gen1 decoder CAPTURE memory budget', capture_pool_gen1_test)
+msm_allocation_test = executable('msm-allocation-test',
+  'tests/vpp/msm-allocation.c', 'src/msm.c',
+  dependencies: drm, c_args: ['-UNDEBUG'], build_by_default: false)
+test('MSM allocation cache modes', msm_allocation_test)
 driver_install_dir = get_option('libdir') / 'dri'
 
 shared_library(
