@@ -7,7 +7,8 @@ also require `ffprobe` and software H.264/HEVC decoding.
 | Test | Coverage |
 | --- | --- |
 | `decoder/main10.cpp` | Main10 8/10-bit capability probing, config validation, surface enumeration, and context bit-depth selection. |
-| `decoder/gen1-capabilities.cpp` | Gen1 decode-only profile/entrypoint restrictions and the 28-render-target limit. |
+| `decoder/gen1-capabilities.cpp` | Seven Gen1 decode-only profiles, Main10/Profile 2 P010 capabilities, encoding rejection, and the 28-render-target limit. |
+| `decoder/gen1-profile-api.cpp` | Hardware-free Gen1 driver-vtable regression with device discovery replaced by test symbols. |
 | `decoder/prime-import.cpp` | PRIME1/PRIME2 NV12/P010 imports, malformed descriptors, shared storage, and caller FD ownership. |
 | `decoder/error-recovery.py` | Corrupt HEVC, queue errors, neutral NV12/P010 pixels, B frames, consecutive errors, DRM mapping, and persistent/imported storage. |
 | `encoder/ffmpeg-smoke.py` | Profiles, rate control, dimensions, frame counts, keyframes, and decoded quality. |
@@ -24,6 +25,24 @@ export LIBVA_DRIVER_NAME=v4l2 LIBVA_DRIVERS_PATH="$PWD/build"
 The PRIME import test requires `/dev/dma_heap/system`. It checks padded layouts
 and nonzero offsets, and verifies that importing and exporting retain the same
 DMA-BUF rather than copying its pixels.
+
+On Gen1, run `decoder/gen1-capabilities.cpp` and `decoder/main10.cpp` only after
+booting a kernel with Gen1 TP10 DPB/P010 output support. Capability checks do not
+prove firmware decoding or display import: separately compare bounded Main10 and
+VP9 Profile 2 decodes against software output, then check both separate-layer
+and composed-layer P010 exports. These hardware checks are not run by the build.
+
+The Gen1 profile API test needs no video or DRM device. Build with exported
+test symbols so device discovery is replaced, then load a Gen1-only driver:
+
+```sh
+c++ -std=c++17 -rdynamic tests/decoder/gen1-profile-api.cpp \
+  -lva -ldl -o tmp/gen1-profile-api
+tmp/gen1-profile-api "$PWD/build-gaokun-iris10bit/v4l2_drv_video.so"
+```
+
+It checks the profile allocation bound, seven profiles, P010 attributes,
+encoding rejection and the 28-render-target limit without submitting frames.
 
 Run error recovery with `python3 tests/decoder/error-recovery.py tmp/recovery
 --driver-dir build` on a kernel with the error-timestamp patch. It generates

@@ -32,10 +32,14 @@ int main() {
     std::vector<VAProfile> profiles(vaMaxNumProfiles(display));
     int profile_count = 0;
     expect(vaQueryConfigProfiles(display, profiles.data(), &profile_count));
-    const VAProfile expected_profiles[] = {VAProfileH264ConstrainedBaseline, VAProfileH264Main,
-                                           VAProfileH264High, VAProfileHEVCMain,
-                                           VAProfileVP9Profile0};
-    require(profile_count == 5, "Gen1 must expose exactly five decode profiles");
+    const VAProfile expected_profiles[] = {VAProfileH264ConstrainedBaseline,
+                                           VAProfileH264Main,
+                                           VAProfileH264High,
+                                           VAProfileHEVCMain,
+                                           VAProfileHEVCMain10,
+                                           VAProfileVP9Profile0,
+                                           VAProfileVP9Profile2};
+    require(profile_count == 7, "Gen1 must expose exactly seven decode profiles");
     for (int i = 0; i < profile_count; ++i)
         require(profiles[i] == expected_profiles[i], "unexpected Gen1 profile");
 
@@ -45,13 +49,32 @@ int main() {
         expect(vaQueryConfigEntrypoints(display, profile, entries.data(), &entry_count));
         require(entry_count == 1 && entries[0] == VAEntrypointVLD,
                 "Gen1 profile must expose only VLD");
+        VAConfigID rejected;
+        expect(vaCreateConfig(display, profile, VAEntrypointEncSlice, nullptr, 0, &rejected),
+               VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT);
     }
 
-    VAConfigID rejected;
-    expect(vaCreateConfig(display, VAProfileHEVCMain10, VAEntrypointVLD, nullptr, 0, &rejected),
-           VA_STATUS_ERROR_UNSUPPORTED_PROFILE);
-    expect(vaCreateConfig(display, VAProfileH264High, VAEntrypointEncSlice, nullptr, 0, &rejected),
-           VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT);
+    for (VAProfile profile : {VAProfileHEVCMain10, VAProfileVP9Profile2}) {
+        VAConfigAttrib attr{VAConfigAttribRTFormat, 0};
+        expect(vaGetConfigAttributes(display, profile, VAEntrypointVLD, &attr, 1));
+        unsigned formats = VA_RT_FORMAT_YUV420_10;
+        if (profile == VAProfileHEVCMain10)
+            formats |= VA_RT_FORMAT_YUV420;
+        require(attr.value == formats, "unexpected Gen1 10-bit render-target formats");
+        attr.value = VA_RT_FORMAT_YUV420_10;
+        VAConfigID config;
+        expect(vaCreateConfig(display, profile, VAEntrypointVLD, &attr, 1, &config));
+        unsigned attribute_count = 0;
+        expect(vaQuerySurfaceAttributes(display, config, nullptr, &attribute_count));
+        std::vector<VASurfaceAttrib> attributes(attribute_count);
+        expect(vaQuerySurfaceAttributes(display, config, attributes.data(), &attribute_count));
+        bool p010 = false;
+        for (const auto &attribute : attributes)
+            if (attribute.type == VASurfaceAttribPixelFormat)
+                p010 |= attribute.value.value.i == VA_FOURCC_P010;
+        require(p010, "Gen1 10-bit profiles must expose P010 surfaces");
+        expect(vaDestroyConfig(display, config));
+    }
 
     VAConfigID config;
     expect(vaCreateConfig(display, VAProfileH264High, VAEntrypointVLD, nullptr, 0, &config));

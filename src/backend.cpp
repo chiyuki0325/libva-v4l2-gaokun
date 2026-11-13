@@ -87,13 +87,8 @@ template <class F> VAStatus guard(VADriverContextP ctx, F f) noexcept {
         return guard(ctx, [&](Driver &d) -> VAStatus { __VA_ARGS__ });                             \
     }
 static bool supported(VAProfile p) {
-#ifdef IRIS_GEN1_DECODE_ONLY
-    return p == VAProfileH264ConstrainedBaseline || p == VAProfileH264Main ||
-           p == VAProfileH264High || p == VAProfileHEVCMain || p == VAProfileVP9Profile0;
-#else
     return p == VAProfileH264ConstrainedBaseline || p == VAProfileH264Main ||
            p == VAProfileH264High || is_hevc(p) || is_vp9(p);
-#endif
 }
 static bool encode_supported(const Driver &d, VAProfile p, VAEntrypoint e) {
 #ifdef IRIS_GEN1_DECODE_ONLY
@@ -262,12 +257,8 @@ API(query_profiles, (VADriverContextP ctx, VAProfile *out, int *count), (void)d;
     check(out && count, "null profiles", VA_STATUS_ERROR_INVALID_PARAMETER);
     out[0] = VAProfileH264ConstrainedBaseline; out[1] = VAProfileH264Main;
     out[2] = VAProfileH264High; out[3] = VAProfileHEVCMain;
-#ifdef IRIS_GEN1_DECODE_ONLY
-    out[4] = VAProfileVP9Profile0; *count = 5;
-#else
     out[4] = VAProfileHEVCMain10; out[5] = VAProfileVP9Profile0; out[6] = VAProfileVP9Profile2;
     *count = 7;
-#endif
     if (vpp_supported(VAProfileNone, VAEntrypointVideoProc)) out[(*count)++] = VAProfileNone;
     return VA_STATUS_SUCCESS;)
 API(query_entrypoints, (VADriverContextP ctx, VAProfile profile, VAEntrypoint *out, int *count),
@@ -1078,7 +1069,7 @@ extern "C" VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
         ctx->version_major = VA_MAJOR_VERSION;
         ctx->version_minor = VA_MINOR_VERSION;
 #ifdef IRIS_GEN1_DECODE_ONLY
-        ctx->max_profiles = 5;
+        ctx->max_profiles = 7;
         ctx->max_entrypoints = 1;
 #else
         ctx->max_profiles = 8;

@@ -4,5 +4,5 @@ option(
   'gen1_decode_only',
   type: 'boolean',
   value: false,
-  description: 'Restrict HFI Gen1 builds to validated 8-bit decode profiles',
+  description: 'Decode-only HFI Gen1 with 32-buffer limits; 10-bit requires Gen1 P010 kernel support',
 )

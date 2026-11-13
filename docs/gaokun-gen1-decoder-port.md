@@ -26,13 +26,15 @@ meson setup build-gaokun-gen1 --buildtype=release \
   -Dgpu_copy=disabled -Dfastcv=disabled -Dgen1_decode_only=true
 ```
 
-`gen1_decode_only` 不探测编码节点，只公布 H.264 Constrained Baseline/Main/High、
-HEVC Main 和 VP9 Profile 0 的解码入口。CAPTURE pool 固定为 32；带超过 28 个
+`gen1_decode_only` 不探测编码节点，公布 H.264 Constrained Baseline/Main/High、
+HEVC Main/Main10 和 VP9 Profile 0/2 的解码入口。Main10/Profile 2 必须搭配
+Gen1 TP10 DPB/P010 输出内核补丁；实现已开放，但尚未完成 Gaokun3 10-bit 实机验收。
+CAPTURE pool 初始固定为 32；带超过 28 个
 render target 的解码上下文会明确返回 `VA_STATUS_ERROR_MAX_NUM_EXCEEDED`，而不是
 向 Gen1 firmware 请求 33–64 个 buffer。该选项默认关闭，避免改变 Q8B HFI
 Gen2 的现有能力。
 
-## 当前基线
+## 初次评估基线（历史）
 
 - 用户态仓库：`radxa-pkg/libva-v4l2`
 - 用户态基线：`6d03c3f8fb19b86f84b2b6c60ff20d1402f0ac41`
@@ -52,7 +54,7 @@ Gen2 的现有能力。
 arch/arm64/boot/dts/qcom/sc8280xp-huawei-gaokun3.dts
 ```
 
-## 总体判断
+## 初次评估判断（历史）
 
 Gen1 的 8-bit 解码适配可行性高。首个可用目标应限定为：
 
@@ -201,7 +203,7 @@ payload 为空的 corrupt/drop frame，公共 buffer-done 层即使改成保留
 
 该修复不阻塞无错误码流的首轮验证，但属于达到稳定可用所需的第二阶段工作。
 
-## 10-bit 解码
+## 10-bit 解码（初次评估的缺口）
 
 10-bit 不是简单增加一个格式枚举。当前已知缺口包括：
 
@@ -224,6 +226,34 @@ VP9 Profile 2，不能让 `vainfo` 把格式枚举误报成可用能力。
 - 内核只枚举真正可用的 Gen1 CAPTURE 格式；
 - 用户态根据 V4L2 codec/CAPTURE format 动态公布 VA profile；
 - 不引入硬编码的产品名或临时“Gen1 全功能”开关。
+
+## 2026-11-13：Gen1 10-bit 联合移植
+
+本轮内核基于 `7.2.15-radxa-gaokun3-suspend` 的 `c289ca5bff75`，新分支
+`7.2.15-radxa-gaokun3-iris10bit`。来源为 `vahiru/gaokun-android` 固定版本
+`d03e3809666851b5cf10b0de364fdb221151e9eb` 的 `iris/0009` 至 `0012`，
+保留四条提交的顺序、作者、标题和原说明：
+
+- 首次 CAPTURE streamon 前发生 flush 时仍配置输出端口；
+- Gen1 firmware watchdog 转入现有 system-error 恢复；
+- CAPTURE S_FMT 保留 firmware 报告的 visible crop；
+- HEVC/VP9 10-bit 使用内部 TP10 UBWC DPB 和外部线性 P010，
+  P010 stride 按 256 字节对齐，继续拒绝 H.264 10-bit 和非渐进内容。
+
+用户态基于 `f9c4e1de12be`，分支为 `master-iris10bit`。只解除 Gen1 的
+Main10/Profile 2 profile 屏蔽，并将 libva 查询容量同步到七个 profile；
+复用已有 P010 码流、CAPTURE、DMA-BUF 导出和 CPU 复制实现，不引入私有 ioctl。
+Main10 公布 8/10-bit，Profile 2 仅公布 10-bit。编码禁止、28 render-target
+检查、初始 32-buffer pool 和 composed 稳定 backing 均保留，Gen2 能力不变。
+
+本轮只做编译、无硬件 API 回归和历史核验。此前 8-bit 实机结果不算作本轮
+10-bit 验收，也不声明旧内核已兼容新 profile。配套内核启动后仍需逐帧对比
+Main10/Profile 2 软件解码结果，再验证 separate/composed 两种 P010 显示路径。
+
+watchdog 恢复会使已有会话失败，不保证无缝续播；当前桥仍不支持上下文内动态
+分辨率变化。空错误 buffer 的 Gen1 时间戳缺口未在此轮修复。P010 增加带宽和
+内存开销，composed 路径仍可能发生 CPU 复制；HDR 元数据、色调映射和桌面
+P010 导入不因本轮解码移植自动完成。
 
 ## 分阶段实施
 

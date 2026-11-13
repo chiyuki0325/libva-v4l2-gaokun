@@ -81,8 +81,10 @@ sudo meson install -C build
   are available, `enabled` requires them. Missing runtime libraries disable
   only VPP. Debian/Ubuntu packages disable FastCV.
 - `-Dgen1_decode_only=true`: for HFI Gen1 systems such as Gaokun3, advertise
-  only H.264 8-bit, HEVC Main and VP9 Profile 0 decoding. Encoding and unvalidated
-  10-bit profiles remain unavailable. Composed-layer exports use stable backing
+  H.264 8-bit, HEVC Main/Main10 and VP9 Profile 0/2 decoding, with a 32-buffer
+  CAPTURE pool and at most 28 context render targets. Main10/Profile 2 require
+  the Gen1 TP10 DPB/P010 output kernel patches; they are not yet hardware-validated
+  on Gaokun3. Encoding remains unavailable. Composed-layer exports use stable backing
   for consumers that cache DMA-BUFs by `VASurfaceID`; separate-layer exports
   retain the zero-copy Iris CAPTURE path. The option is disabled by default so
   HFI Gen2 builds retain their existing capabilities.
