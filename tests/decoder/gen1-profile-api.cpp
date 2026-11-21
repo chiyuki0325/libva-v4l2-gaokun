@@ -61,7 +61,18 @@ int main(int argc, char **argv) {
     auto expected_profiles = expected;
     if (have_vpp)
         expected_profiles.push_back(VAProfileNone);
-    require(count == driver.max_profiles && profiles == expected_profiles, "unexpected Gen1 profiles");
+    require(count == driver.max_profiles && profiles == expected_profiles,
+            "unexpected Gen1 profiles");
+    if (have_vpp) {
+        VAEntrypoint entrypoint{};
+        int entry_count = 0;
+        expect(table.vaQueryConfigEntrypoints(&driver, VAProfileNone, &entrypoint, &entry_count));
+        require(entry_count == 1 && entrypoint == VAEntrypointVideoProc, "VPP entrypoint");
+        VAConfigID config;
+        expect(
+            table.vaCreateConfig(&driver, VAProfileNone, VAEntrypointEncSlice, nullptr, 0, &config),
+            VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT);
+    }
     for (VAProfile profile : expected) {
         VAEntrypoint entrypoint{};
         int entry_count = 0;

@@ -23,7 +23,8 @@ Gaokun3 用户态构建应显式使用：
 
 ```sh
 meson setup build-gaokun-gen1 --buildtype=release \
-  -Dgpu_copy=disabled -Dfastcv=disabled -Dgen1_decode_only=true
+  -Dgpu_copy=disabled -Dcdsp_vpp=disabled -Dvulkan_vpp=disabled \
+  -Dgen1_decode_only=true
 ```
 
 `gen1_decode_only` 不探测编码节点，公布 H.264 Constrained Baseline/Main/High、
@@ -34,6 +35,10 @@ CAPTURE pool 默认目标为 32、上限为 32，并按协商后的单缓冲区�
 render target 的解码上下文会明确返回 `VA_STATUS_ERROR_MAX_NUM_EXCEEDED`，而不是
 向 Gen1 firmware 请求 33–64 个 buffer。该选项默认关闭，避免改变 Q8B HFI
 Gen2 的现有能力。
+
+上述命令构建纯解码版本。Vulkan VPP可独立于HFI Gen1启用，
+详见[移植与验证记录](gaokun-vulkan-vpp.md)；启用后另行公布
+`VAProfileNone / VAEntrypointVideoProc`，不开放编码或AV1。
 
 ## 初次评估基线（历史）
 

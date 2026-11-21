@@ -53,9 +53,8 @@ depends on content and pipeline.
   output, larger CAPTURE pools, encoder deblocking controls, and error timestamps.
 - C++17 compiler, Meson ≥ 0.61, Ninja, pkg-config, libva ≥ 1.10 and libdrm
   development libraries. GPU-copy also requires EGL, GLES 3.2, and GBM.
-- CDSP VPP is enabled by default and requires a Linux ARM64 build machine,
-  GHC and `syb`.
-  Use `-Dcdsp_vpp=disabled` to skip its dependencies and downloads.
+- CDSP VPP is disabled by default in this fork. Enabling it requires a Linux
+  ARM64 build machine, GHC and `syb`, and downloads the DSP toolchain.
 
 ## Build and install
 
@@ -89,6 +88,19 @@ sudo meson install -C build
   retain the zero-copy Iris CAPTURE path. The option is disabled by default so
   HFI Gen2 builds retain their existing capabilities.
 
+For Gaokun3 with Vulkan VPP and no CDSP dependencies:
+
+```sh
+meson setup build-gaokun-vulkan --buildtype=release --wrap-mode=nodownload \
+  -Dgen1_decode_only=true -Dgpu_copy=disabled -Dcdsp_vpp=disabled \
+  -Dvulkan_vpp=enabled -Dvpp_backend=vulkan
+meson compile -C build-gaokun-vulkan
+```
+
+VPP adds `VAProfileNone / VAEntrypointVideoProc` to the seven Gen1 decode
+profiles without enabling encoding or AV1. See the
+[Gaokun Vulkan validation record](docs/gaokun-vulkan-vpp.md).
+
 Adjust `libdir` if drivers belong somewhere other than `/usr/lib/dri`.
 The installed MSM alias selects this backend automatically on the target platform.
 Check installation with `vainfo` (`libva-utils` on Arch):
@@ -100,8 +112,9 @@ vainfo --display drm --device /dev/dri/renderD128
 ## CDSP video processing
 
 Meson downloads pinned QAIC and Hexagon Open Access **19.0.02**, using system
-FastRPC or a source fallback. No full SDK is needed. Arch packaging enables CDSP;
-Debian disables it. See [CDSP build and runtime requirements](src/cdsp/README.md).
+FastRPC or a source fallback. No full SDK is needed. Arch and Debian packaging
+disable CDSP and enable Vulkan in this fork.
+See [CDSP build and runtime requirements](src/cdsp/README.md).
 
 Both CDSP and Vulkan support NV12/P010 cropping, scaling, conversion and
 clockwise 90°/180°/270° rotation, including combined operations. Dimensions

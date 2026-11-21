@@ -45,6 +45,10 @@ c++ -std=c++17 -rdynamic tests/decoder/gen1-profile-api.cpp \
 tmp/gen1-profile-api "$PWD/build-gaokun-iris10bit/v4l2_drv_video.so"
 ```
 
+For a Vulkan VPP build, use its driver path and append `--vpp`; the profile
+allocation bound must include `VAProfileNone` in addition to the seven decode
+profiles. `gen1-capabilities.cpp` also accepts the optional VideoProc profile.
+
 It checks the profile allocation bound, seven profiles, P010 attributes,
 encoding rejection and the 28-render-target limit without submitting frames.
 

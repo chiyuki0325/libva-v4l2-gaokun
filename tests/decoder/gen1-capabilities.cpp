@@ -39,9 +39,17 @@ int main() {
                                            VAProfileHEVCMain10,
                                            VAProfileVP9Profile0,
                                            VAProfileVP9Profile2};
-    require(profile_count == 7, "Gen1 must expose exactly seven decode profiles");
-    for (int i = 0; i < profile_count; ++i)
+    require(profile_count == 7 || profile_count == 8,
+            "Gen1 must expose seven decode profiles and optional VPP");
+    for (int i = 0; i < 7; ++i)
         require(profiles[i] == expected_profiles[i], "unexpected Gen1 profile");
+    if (profile_count == 8) {
+        require(profiles[7] == VAProfileNone, "only VPP may extend Gen1 decode profiles");
+        VAEntrypoint entrypoint;
+        int entry_count = 0;
+        expect(vaQueryConfigEntrypoints(display, VAProfileNone, &entrypoint, &entry_count));
+        require(entry_count == 1 && entrypoint == VAEntrypointVideoProc, "VPP entrypoint");
+    }
 
     for (VAProfile profile : expected_profiles) {
         std::vector<VAEntrypoint> entries(vaMaxNumEntrypoints(display));
